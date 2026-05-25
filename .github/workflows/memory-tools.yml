@@ -1,0 +1,27 @@
+name: Memory tools placeholders
+
+on:
+  workflow_dispatch:
+
+jobs:
+  asan-open-question:
+    name: ASAN setup OPEN QUESTION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Explain ASAN status
+        run: |
+          echo "OPEN QUESTION: ASAN setup is not specified by the contract."
+          echo "Do not add a guessed ASAN configuration without Roman approval."
+          exit 1
+
+  valgrind-open-question:
+    name: Valgrind setup OPEN QUESTION
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Explain Valgrind status
+        run: |
+          echo "OPEN QUESTION: Valgrind setup and acceptable CI subset need Roman approval."
+          echo "Do not add a guessed Valgrind configuration without Roman approval."
+          exit 1

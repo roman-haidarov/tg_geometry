@@ -1,0 +1,16 @@
+# tg_geometry vendor manifest. Do not edit by hand. Regenerate with: ruby script/vendor_libs.rb --sync
+gem=tg_geometry
+libraries=tg,rtree
+tg_repo=https://github.com/tidwall/tg.git
+tg_ref=main
+tg_commit=caf840504eaab4563280cf4ab16d618f69a23720
+tg_target=tg
+tg_files=tg.c,tg.h,LICENSE,README.md,VERSION
+tg_tree_sha256=f8e0d904055c209b2a23a2200456f9374ab95cadb69e61b5721d7f8e2500e705
+rtree_repo=https://github.com/tidwall/rtree.c.git
+rtree_ref=v0.5.3
+rtree_commit=5717a8a1eb373428ebaae8c1c623f186ec46461f
+rtree_target=rtree
+rtree_files=rtree.c,rtree.h,LICENSE,README.md,VERSION
+rtree_tree_sha256=4afc86cbd3abe03730206031a5aff5b8b29d37b055fc356052f6f06e1d1f9a61
+manifest_sha256=b7e0c21dc3bc29918b1336f30d1d08ee2a32083b77ece8a5e56d77651a1d3a98
