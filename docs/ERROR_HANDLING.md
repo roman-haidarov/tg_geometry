@@ -53,3 +53,33 @@ Rtree allocator callbacks return `NULL` on OOM. Rtree search callbacks record fa
 ## Writer safety
 
 Text writers allocate Ruby strings with one extra byte for the null terminator, call the TG writer with that capacity, then set the Ruby string length back to the required content length. WKB allocates exactly the required binary length and associates `ASCII-8BIT` encoding.
+
+## FeatureSource errors and reports
+
+FeatureSource validates the whole JSON source before traversal. Malformed JSON raises `TG::Geometry::ParseError` with the byte offset when available. A root that is not a GeoJSON `FeatureCollection`, or a `features` member that is missing/not an array, also raises `TG::Geometry::ParseError`.
+
+Invalid feature data is fail-fast by default:
+
+- missing/non-object geometry;
+- missing/non-string `geometry.type`;
+- unsupported geometry type;
+- invalid properties type for `read_features_*`;
+- TG parse error for a geometry range.
+
+`on_invalid: :skip` is accepted only with `report: true`. In report mode invalid features increment `:skipped`; filtered geometry types increment `:filtered`.
+
+Missing or `null` ids follow `on_missing_id:`:
+
+- `:raise` raises `TG::Geometry::ArgumentError`;
+- `:skip` requires `report: true` and records a skipped feature;
+- `:ordinal` creates an id like `"feature/12"`.
+
+Invalid id types raise `TG::Geometry::ArgumentError`: boolean, object, array, fractional number, and non-integer exponent number are not accepted FeatureSource ids.
+
+Stored report errors have this shape:
+
+```ruby
+{ feature_index: Integer, byte_offset: Integer, reason: String }
+```
+
+`max_errors:` caps the number of stored error Hashes, not the exact skipped count. TG geometry parse errors copy `tg_geom_error` before freeing the temporary TG error geometry and include feature index / byte offset in the raised message.

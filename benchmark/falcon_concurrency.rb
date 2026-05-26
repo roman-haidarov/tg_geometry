@@ -4,7 +4,7 @@ require_relative "_support"
 
 TGGeometryBench.say_header("falcon_concurrency")
 puts "No Falcon dependency is used here. This is a thread-read baseline for the immutable Index model."
-puts "Falcon/Async behavior remains an OPEN QUESTION until Roman approves a dedicated dependency/setup."
+puts "Falcon/Async behavior remains an Pending decision until Roman approves a dedicated dependency/setup."
 
 entries = TGGeometryBench.compact_entries(1_000)
 index = TGGeometryBench.build_index(entries, strategy: :rtree)
