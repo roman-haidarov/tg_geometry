@@ -11,9 +11,9 @@ module TG
       }.freeze
 
       class << self
-        def source(&block)
-          if block
-            @source = block
+        def source(&definition)
+          if definition
+            @source = definition
           elsif instance_variable_defined?(:@source)
             @source
           elsif superclass.respond_to?(:source)

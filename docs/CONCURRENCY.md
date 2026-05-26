@@ -20,17 +20,25 @@ A reader that already captured `old_index` can finish safely. Later readers can 
 
 ## GVL policy
 
-The first release does not release the GVL for:
+Most short operations keep the GVL:
 
-- parse;
+- parse helpers;
 - writers;
 - `Geom` predicates;
 - Index point queries;
 - Index rect queries;
 - packed batch queries;
-- index build/free.
+- rtree build/free and Ruby result materialization.
 
-This is intentional. Incorrect no-GVL code is worse than keeping GVL. Future no-GVL work requires benchmark evidence, input copying rules, and no Ruby C API calls outside the GVL.
+FeatureSource bulk methods are the exception. Their heavy source-processing phase runs without the GVL:
+
+- `_file` methods open/read the file in C outside the GVL;
+- JSON validation and `tidwall/json.c` traversal run outside the GVL;
+- geometry validation/parsing with TG runs outside the GVL.
+
+That phase uses only C-owned memory. It does not create Ruby objects, call Ruby methods, raise Ruby exceptions, or call `rb_gc_adjust_memory_usage`. Ruby ids/strings/reports and Index ownership transfer happen only after the GVL is reacquired.
+
+FeatureSource uses only Ruby VM no-GVL APIs for this phase. On Rubies exposing `RB_NOGVL_OFFLOAD_SAFE`, the heavy function is marked offload-safe for the VM. On older Rubies it uses `rb_thread_call_without_gvl`. The gem does not call `rb_fiber_scheduler_block` / `rb_fiber_scheduler_unblock` and does not run a manual scheduler worker from C. Therefore FeatureSource releases the GVL for other Ruby threads, but explicit Fiber scheduler friendliness is only claimed when the Ruby VM provides the offload-safe no-GVL API.
 
 ## Rtree owner thread-local
 
@@ -52,9 +60,7 @@ Callback rules:
 
 ## Ractor
 
-No Ractor support is claimed. Expansion Block I records the current boundary: frozen native wrappers are not treated as Ractor-shareable objects, and tests assert that `Ractor.shareable?` remains false for `TG::Geometry::Geom`, `TG::Geometry::Rect`, and `TG::Geometry::Index`.
-
-See `docs/RACTOR.md` for the unsupported-boundary notes and the requirements before this status can change.
+No Ractor support is claimed. Frozen native wrappers are not advertised as Ractor-shareable objects. Normal Ruby thread read-only access is the supported concurrency model.
 
 ## Falcon / Async
 
