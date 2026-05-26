@@ -85,10 +85,28 @@ For `via: :geojson` and `via: :wkb`, the Index owns each parsed TG geometry. The
 
 ## Low-level child wrappers
 
-Expansion Block E exposes read-only borrowed wrappers for selected TG child types. `TG::Geometry::Line`, `TG::Geometry::Ring`, and `TG::Geometry::Polygon` keep the original parent `TG::Geometry::Geom` Ruby object in `geom_owner`. Their GC callbacks use `rb_gc_mark_movable` and `rb_gc_location`, matching the Index borrowed-geometry model.
+Planned API areas exposes read-only borrowed wrappers for selected TG child types. `TG::Geometry::Line`, `TG::Geometry::Ring`, and `TG::Geometry::Polygon` keep the original parent `TG::Geometry::Geom` Ruby object in `geom_owner`. Their GC callbacks use `rb_gc_mark_movable` and `rb_gc_location`, matching the Index borrowed-geometry model.
 
-Expansion Block J extends this model to borrowed `TG::Geometry::Geom` wrappers returned from GeometryCollection accessors. A borrowed `Geom` stores `owned = false`, `geom_bytes = 0`, and a `geom_owner` reference to the parent wrapper. Its free path only releases the Ruby wrapper struct; it never calls `tg_geom_free` on the borrowed child pointer. This keeps `ObjectSpace.memsize_of` from double-counting parent-owned native geometry.
+Planned API areas extends this model to borrowed `TG::Geometry::Geom` wrappers returned from GeometryCollection accessors. A borrowed `Geom` stores `owned = false`, `geom_bytes = 0`, and a `geom_owner` reference to the parent wrapper. Its free path only releases the Ruby wrapper struct; it never calls `tg_geom_free` on the borrowed child pointer. This keeps `ObjectSpace.memsize_of` from double-counting parent-owned native geometry.
 
 `TG::Geometry::Segment` is different: it stores a `struct tg_segment` by value, not a borrowed pointer. It has no parent owner to mark and no TG deallocator to call.
 
 Line/Ring/Polygon wrappers own only their small Ruby-allocated wrapper structs. They do not own the underlying `const struct tg_line *`, `const struct tg_ring *`, or `const struct tg_poly *`. Cleanup therefore only calls `ruby_xfree` for the wrapper; the parent `TG::Geometry::Geom` remains responsible for the single `tg_geom_free`.
+
+## FeatureSource ownership
+
+FeatureSource adds only method-scope JSON resources. It does not introduce a persistent FeatureSource object type.
+
+Resource | Allocator | Deallocator | Owner | Notes
+--- | --- | --- | --- | ---
+FeatureSource source buffer | `ruby_xmalloc` | `ruby_xfree` | FeatureSource method scope | full file/json/io content copy; freed through ensure-style cleanup
+FeatureSource geometry JSON output | Ruby `String` | Ruby GC | returned Array | copied from source buffer before buffer free; UTF-8 encoded
+FeatureSource properties JSON output | Ruby `String` | Ruby GC | returned Array | copied from source buffer or literal `"null"`; UTF-8 encoded
+`tidwall/json.c` `struct json` / raw range | backed by source buffer | none | local traversal scope | invalid after source buffer free; never stored in Ruby object/native index
+FeatureSource validation geometry | `tg_parse_geojsonn_ix` | `tg_geom_free` | local validation scope | used by `read_entries_*` / `read_features_*`; freed immediately
+FeatureSource build index geometry | `tg_parse_geojsonn_ix` | `tg_geom_free` via `index_dispose` | `TG::Geometry::Index` | direct parse from JSON raw range; no Ruby geometry string allocation
+FeatureSource build id | Ruby VM | Ruby GC | `TG::Geometry::Index` entry | wrapper is created before entries are filled; `initialized` controls mark/compact boundary
+
+The source buffer must outlive every JSON range and every `tg_parse_geojsonn_ix` call that receives a pointer into it. After `build_index_*` succeeds, the returned Index owns native TG geometries and no longer depends on the source buffer.
+
+`read_entries_*` and `read_features_*` copy output strings before freeing the buffer. Returned arrays never contain pointers into the native source buffer.

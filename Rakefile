@@ -82,7 +82,7 @@ begin
     end
 
     RSpec::Core::RakeTask.new(:gc_compact => "compile:test") do |task|
-      task.pattern = "spec/block_3_geom_parse_spec.rb spec/block_6_index_build_spec.rb spec/block_8_index_borrowed_geometry_spec.rb spec/block_14_memory_gc_hardening_spec.rb"
+      task.pattern = "spec/geom_parse_spec.rb spec/index_build_spec.rb spec/index_borrowed_geometry_spec.rb spec/memory_gc_spec.rb"
     end
   end
 rescue LoadError
@@ -109,12 +109,12 @@ namespace :benchmark do
 end
 
 namespace :vendor do
-  desc "Sync vendored tidwall/tg and rtree.c sources to pinned commits"
+  desc "Sync vendored C sources to pinned commits"
   task :sync do
     ruby "script/vendor_libs.rb", "--sync"
   end
 
-  desc "Verify vendored tidwall/tg and rtree.c sources against pinned tree SHA256"
+  desc "Verify vendored C sources against pinned tree SHA256"
   task :verify do
     ruby "script/vendor_libs.rb", "--verify"
   end

@@ -11,6 +11,11 @@
 #endif
 #include "ruby.h"
 #include "ruby/encoding.h"
+#include "ruby/thread.h"
+#if __has_include("ruby/fiber/scheduler.h")
+#include "ruby/fiber/scheduler.h"
+#define TG_GEOMETRY_HAVE_FIBER_SCHEDULER_HEADER 1
+#endif
 #if defined(__clang__)
 #pragma clang diagnostic pop
 #elif defined(__GNUC__)
@@ -19,19 +24,31 @@
 
 #include "tg.h"
 #include "rtree.h"
+#include "json.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#if defined(__GNUC__) || defined(__clang__)
+#define TG_GEOMETRY_NORETURN __attribute__((noreturn))
+#else
+#define TG_GEOMETRY_NORETURN
+#endif
 
 static VALUE mTG;
 static VALUE mTGGeometry;
 static VALUE cTGGeometryGeom;
 static VALUE cTGGeometryRect;
 static VALUE cTGGeometryIndex;
+static VALUE mTGGeometryFeatureSource;
 static VALUE cTGGeometryLine;
 static VALUE cTGGeometryRing;
 static VALUE cTGGeometryPolygon;
@@ -149,6 +166,24 @@ static ID id_flat;
 static ID id_rtree;
 static ID id_covers;
 static ID id_contains;
+static ID id_id;
+static ID id_only;
+static ID id_on_invalid;
+static ID id_on_missing_id;
+static ID id_report;
+static ID id_max_errors;
+static ID id_read;
+static ID id_join;
+static ID id_raise;
+static ID id_skip;
+static ID id_ordinal;
+static ID id_polygon;
+static ID id_multipolygon;
+static ID id_point;
+static ID id_linestring;
+static ID id_multipoint;
+static ID id_multilinestring;
+static ID id_geometrycollection;
 
 #ifdef TG_DEBUG_TEST
 static bool tg_debug_fail_next_entries_alloc = false;
@@ -2854,6 +2889,2361 @@ static VALUE rb_tg_geometry_index_force_dispose_for_test(VALUE self) {
 }
 #endif
 
+typedef enum {
+    FS_MODE_READ_ENTRIES,
+    FS_MODE_READ_FEATURES,
+    FS_MODE_BUILD_INDEX,
+} fs_mode_t;
+
+typedef enum {
+    FS_ON_INVALID_RAISE,
+    FS_ON_INVALID_SKIP,
+} fs_on_invalid_t;
+
+typedef enum {
+    FS_ON_MISSING_ID_RAISE,
+    FS_ON_MISSING_ID_SKIP,
+    FS_ON_MISSING_ID_ORDINAL,
+} fs_on_missing_id_t;
+
+#define FS_GEOM_POINT              (1u << 0)
+#define FS_GEOM_LINESTRING         (1u << 1)
+#define FS_GEOM_POLYGON            (1u << 2)
+#define FS_GEOM_MULTIPOINT         (1u << 3)
+#define FS_GEOM_MULTILINESTRING    (1u << 4)
+#define FS_GEOM_MULTIPOLYGON       (1u << 5)
+#define FS_GEOM_GEOMETRYCOLLECTION (1u << 6)
+
+typedef struct {
+    VALUE id_path;
+    bool only_all;
+    unsigned int only_mask;
+    fs_on_invalid_t on_invalid;
+    fs_on_missing_id_t on_missing_id;
+    bool report;
+    long max_errors;
+    enum tg_index geometry_index;
+    enum tg_geometry_index_strategy strategy;
+    enum tg_geometry_index_predicate predicate;
+} fs_options_t;
+
+typedef struct {
+    char *data;
+    size_t len;
+} fs_source_t;
+
+typedef struct {
+    fs_source_t source;
+    fs_options_t opts;
+    fs_mode_t mode;
+} fs_args_t;
+
+typedef struct {
+    fs_args_t *fs;
+    struct json features;
+    VALUE wrapper;
+    tg_index_t *idx;
+} fs_build_args_t;
+
+typedef struct {
+    bool accepted;
+    bool filtered;
+    bool missing_id_skip;
+    VALUE id;
+    struct json feature;
+    struct json geometry;
+    struct json properties;
+    const char *reason;
+    VALUE reason_value;
+} fs_feature_result_t;
+
+static VALUE fs_sym(const char *name) {
+    return ID2SYM(rb_intern(name));
+}
+
+static VALUE fs_kwargs_value(VALUE kwargs, ID key, VALUE fallback, bool *present) {
+    VALUE sym = ID2SYM(key);
+    if (NIL_P(kwargs)) {
+        if (present)
+            *present = false;
+        return fallback;
+    }
+    if (RTEST(rb_funcall(kwargs, rb_intern("key?"), 1, sym))) {
+        if (present)
+            *present = true;
+        return rb_hash_aref(kwargs, sym);
+    }
+    if (present)
+        *present = false;
+    return fallback;
+}
+
+static VALUE fs_utf8_string(const char *ptr, size_t len) {
+    VALUE str;
+
+    if (len > LONG_MAX) {
+        rb_raise(rb_eNoMemError, "FeatureSource JSON substring is too large");
+    }
+
+    str = rb_str_new(ptr, (long)len);
+    rb_enc_associate(str, rb_utf8_encoding());
+    return str;
+}
+
+static VALUE fs_cstr_utf8_string(const char *ptr) {
+    VALUE str = rb_str_new_cstr(ptr);
+    rb_enc_associate(str, rb_utf8_encoding());
+    return str;
+}
+
+static size_t fs_json_offset(fs_source_t *source, struct json value) {
+    const char *raw = json_raw(value);
+
+    if (!raw || raw < source->data || raw > source->data + source->len) {
+        return 0;
+    }
+
+    return (size_t)(raw - source->data);
+}
+
+static VALUE fs_error_hash(long feature_index, size_t byte_offset, VALUE reason) {
+    VALUE h = rb_hash_new();
+    rb_hash_aset(h, fs_sym("feature_index"), LONG2NUM(feature_index));
+    rb_hash_aset(h, fs_sym("byte_offset"), ULL2NUM((unsigned long long)byte_offset));
+    rb_hash_aset(h, fs_sym("reason"), reason);
+    return h;
+}
+
+static void fs_report_error(VALUE errors, long max_errors, long feature_index, size_t byte_offset,
+                            VALUE reason) {
+    if (RARRAY_LEN(errors) < max_errors) {
+        rb_ary_push(errors, fs_error_hash(feature_index, byte_offset, reason));
+    }
+}
+
+static void TG_GEOMETRY_NORETURN fs_raise_parse_error_value(long feature_index, size_t byte_offset,
+                                                            VALUE reason) {
+    VALUE prefix =
+        rb_sprintf("feature %ld at byte %llu: ", feature_index, (unsigned long long)byte_offset);
+    VALUE message = rb_str_plus(prefix, reason);
+    rb_exc_raise(rb_exc_new_str(eTGGeometryParseError, message));
+}
+
+static void TG_GEOMETRY_NORETURN fs_raise_argument_error(long feature_index, size_t byte_offset,
+                                                         const char *reason) {
+    rb_raise(eTGGeometryArgumentError, "feature %ld at byte %llu: %s", feature_index,
+             (unsigned long long)byte_offset, reason);
+}
+
+static VALUE fs_copy_json_string_value(struct json value) {
+    size_t len = json_string_copy(value, NULL, 0);
+    VALUE str;
+
+    if (len > LONG_MAX) {
+        rb_raise(rb_eNoMemError, "JSON string is too large");
+    }
+
+    str = rb_str_new(NULL, (long)len + 1);
+    json_string_copy(value, RSTRING_PTR(str), len + 1);
+    rb_str_set_len(str, (long)len);
+    rb_enc_associate(str, rb_utf8_encoding());
+    return str;
+}
+
+static bool fs_json_number_is_integer(struct json value) {
+    const char *raw = json_raw(value);
+    size_t len = json_raw_length(value);
+
+    if (!raw || len == 0)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        if (raw[i] == '.' || raw[i] == 'e' || raw[i] == 'E')
+            return false;
+    }
+    return true;
+}
+
+static bool fs_integer_id_from_json(struct json value, VALUE *id_out, VALUE *error_message) {
+    const char *raw = json_raw(value);
+    size_t len = json_raw_length(value);
+    char stack[64];
+    char *buf = stack;
+    char *endp = NULL;
+    long long parsed;
+
+    if (!fs_json_number_is_integer(value)) {
+        *error_message = rb_str_new_cstr("invalid id: numeric id must be an integer");
+        return false;
+    }
+
+    if (len >= sizeof(stack)) {
+        buf = (char *)malloc(len + 1);
+        if (!buf)
+            rb_raise(rb_eNoMemError, "id buffer allocation failed");
+    }
+
+    memcpy(buf, raw, len);
+    buf[len] = '\0';
+    errno = 0;
+    parsed = strtoll(buf, &endp, 10);
+
+    if (errno != 0 || endp != buf + len) {
+        if (buf != stack)
+            free(buf);
+        *error_message = rb_str_new_cstr("invalid id: integer is out of range");
+        return false;
+    }
+
+    *id_out = LL2NUM(parsed);
+    if (buf != stack)
+        free(buf);
+    return true;
+}
+
+static bool fs_validate_integer_id_json(struct json value, VALUE *error_message) {
+    const char *raw = json_raw(value);
+    size_t len = json_raw_length(value);
+    char stack[64];
+    char *buf = stack;
+    char *endp = NULL;
+
+    if (!fs_json_number_is_integer(value)) {
+        *error_message = rb_str_new_cstr("invalid id: numeric id must be an integer");
+        return false;
+    }
+
+    if (len >= sizeof(stack)) {
+        buf = (char *)malloc(len + 1);
+        if (!buf)
+            rb_raise(rb_eNoMemError, "id buffer allocation failed");
+    }
+
+    memcpy(buf, raw, len);
+    buf[len] = '\0';
+    errno = 0;
+    (void)strtoll(buf, &endp, 10);
+
+    if (errno != 0 || endp != buf + len) {
+        if (buf != stack)
+            free(buf);
+        *error_message = rb_str_new_cstr("invalid id: integer is out of range");
+        return false;
+    }
+
+    if (buf != stack)
+        free(buf);
+    return true;
+}
+
+static bool fs_id_from_json_value(struct json value, VALUE *id_out, VALUE *error_message,
+                                  bool materialize_id) {
+    switch (json_type(value)) {
+    case JSON_STRING:
+        *id_out = materialize_id ? fs_copy_json_string_value(value) : Qnil;
+        return true;
+    case JSON_NUMBER:
+        if (!materialize_id) {
+            *id_out = Qnil;
+            return fs_validate_integer_id_json(value, error_message);
+        }
+        return fs_integer_id_from_json(value, id_out, error_message);
+    case JSON_NULL:
+    case JSON_TRUE:
+    case JSON_FALSE:
+    case JSON_ARRAY:
+    case JSON_OBJECT:
+        *error_message = rb_str_new_cstr("invalid id: expected JSON string or integer number");
+        return false;
+    }
+
+    *error_message = rb_str_new_cstr("invalid id");
+    return false;
+}
+
+static VALUE fs_default_id_path(void) {
+    return rb_ary_new_from_args(2, fs_cstr_utf8_string("properties"), fs_cstr_utf8_string("@id"));
+}
+
+static VALUE fs_normalize_id_path(VALUE value) {
+    VALUE path;
+
+    if (NIL_P(value)) {
+        return fs_default_id_path();
+    }
+
+    if (RB_TYPE_P(value, T_STRING)) {
+        path = rb_funcall(value, rb_intern("split"), 1, rb_str_new_cstr("."));
+    } else if (RB_TYPE_P(value, T_ARRAY)) {
+        path = rb_ary_dup(value);
+    } else {
+        rb_raise(eTGGeometryArgumentError, "id: must be String or Array<String>");
+    }
+
+    if (RARRAY_LEN(path) == 0) {
+        rb_raise(eTGGeometryArgumentError, "id: path cannot be empty");
+    }
+
+    for (long i = 0; i < RARRAY_LEN(path); i++) {
+        VALUE part = rb_ary_entry(path, i);
+        if (!RB_TYPE_P(part, T_STRING)) {
+            rb_raise(eTGGeometryArgumentError, "id: every path component must be String");
+        }
+    }
+
+    return path;
+}
+
+static bool fs_json_get_path(struct json root, VALUE path, struct json *out) {
+    struct json cur = root;
+
+    for (long i = 0; i < RARRAY_LEN(path); i++) {
+        VALUE key = rb_ary_entry(path, i);
+        StringValue(key);
+        cur = json_object_get(cur, StringValueCStr(key));
+        if (!json_exists(cur)) {
+            *out = (struct json){0};
+            return false;
+        }
+    }
+
+    *out = cur;
+    return true;
+}
+
+static unsigned int fs_geometry_type_bit(struct json type_value) {
+    if (json_string_compare(type_value, "Point") == 0)
+        return FS_GEOM_POINT;
+    if (json_string_compare(type_value, "LineString") == 0)
+        return FS_GEOM_LINESTRING;
+    if (json_string_compare(type_value, "Polygon") == 0)
+        return FS_GEOM_POLYGON;
+    if (json_string_compare(type_value, "MultiPoint") == 0)
+        return FS_GEOM_MULTIPOINT;
+    if (json_string_compare(type_value, "MultiLineString") == 0)
+        return FS_GEOM_MULTILINESTRING;
+    if (json_string_compare(type_value, "MultiPolygon") == 0)
+        return FS_GEOM_MULTIPOLYGON;
+    if (json_string_compare(type_value, "GeometryCollection") == 0)
+        return FS_GEOM_GEOMETRYCOLLECTION;
+    return 0;
+}
+
+static unsigned int fs_symbol_geometry_type_bit(VALUE sym) {
+    ID id;
+
+    if (!SYMBOL_P(sym)) {
+        rb_raise(eTGGeometryArgumentError, "only: must contain geometry type symbols");
+    }
+
+    id = SYM2ID(sym);
+    if (id == id_point)
+        return FS_GEOM_POINT;
+    if (id == id_linestring)
+        return FS_GEOM_LINESTRING;
+    if (id == id_polygon)
+        return FS_GEOM_POLYGON;
+    if (id == id_multipoint)
+        return FS_GEOM_MULTIPOINT;
+    if (id == id_multilinestring)
+        return FS_GEOM_MULTILINESTRING;
+    if (id == id_multipolygon)
+        return FS_GEOM_MULTIPOLYGON;
+    if (id == id_geometrycollection)
+        return FS_GEOM_GEOMETRYCOLLECTION;
+
+    rb_raise(eTGGeometryArgumentError,
+             "only: must contain one of :point, :linestring, :polygon, :multipoint, "
+             ":multilinestring, :multipolygon, :geometrycollection");
+}
+
+static void fs_parse_only_option(fs_options_t *opts, VALUE value, bool present) {
+    opts->only_all = false;
+    opts->only_mask = FS_GEOM_POLYGON | FS_GEOM_MULTIPOLYGON;
+
+    if (present && NIL_P(value)) {
+        opts->only_all = true;
+        opts->only_mask = 0;
+        return;
+    }
+
+    if (!present) {
+        return;
+    }
+
+    if (!RB_TYPE_P(value, T_ARRAY)) {
+        rb_raise(eTGGeometryArgumentError, "only: must be Array<Symbol> or nil");
+    }
+
+    opts->only_mask = 0;
+    for (long i = 0; i < RARRAY_LEN(value); i++) {
+        opts->only_mask |= fs_symbol_geometry_type_bit(rb_ary_entry(value, i));
+    }
+}
+
+static fs_on_invalid_t fs_parse_on_invalid(VALUE value) {
+    ID id;
+    if (!SYMBOL_P(value)) {
+        rb_raise(eTGGeometryArgumentError, "on_invalid: must be one of :raise, :skip");
+    }
+    id = SYM2ID(value);
+    if (id == id_raise)
+        return FS_ON_INVALID_RAISE;
+    if (id == id_skip)
+        return FS_ON_INVALID_SKIP;
+    rb_raise(eTGGeometryArgumentError, "on_invalid: must be one of :raise, :skip");
+}
+
+static fs_on_missing_id_t fs_parse_on_missing_id(VALUE value) {
+    ID id;
+    if (!SYMBOL_P(value)) {
+        rb_raise(eTGGeometryArgumentError, "on_missing_id: must be one of :raise, :skip, :ordinal");
+    }
+    id = SYM2ID(value);
+    if (id == id_raise)
+        return FS_ON_MISSING_ID_RAISE;
+    if (id == id_skip)
+        return FS_ON_MISSING_ID_SKIP;
+    if (id == id_ordinal)
+        return FS_ON_MISSING_ID_ORDINAL;
+    rb_raise(eTGGeometryArgumentError, "on_missing_id: must be one of :raise, :skip, :ordinal");
+}
+
+static bool fs_bool_option(VALUE value, const char *name) {
+    if (value == Qtrue)
+        return true;
+    if (value == Qfalse)
+        return false;
+    rb_raise(eTGGeometryArgumentError, "%s must be true or false", name);
+}
+
+static bool fs_keyword_allowed(ID key_id, fs_mode_t mode) {
+    if (key_id == id_id || key_id == id_only || key_id == id_on_invalid ||
+        key_id == id_on_missing_id || key_id == id_geometry_index) {
+        return true;
+    }
+
+    if (mode == FS_MODE_BUILD_INDEX) {
+        return key_id == id_strategy || key_id == id_predicate || key_id == id_report;
+    }
+
+    return key_id == id_report || key_id == id_max_errors;
+}
+
+static int fs_validate_keyword_i(VALUE key, VALUE value, VALUE mode_value) {
+    fs_mode_t mode = (fs_mode_t)NUM2INT(mode_value);
+    (void)value;
+
+    if (!SYMBOL_P(key) || !fs_keyword_allowed(SYM2ID(key), mode)) {
+        VALUE inspected = rb_inspect(key);
+        rb_raise(eTGGeometryArgumentError, "unknown keyword: %s", StringValueCStr(inspected));
+    }
+
+    return ST_CONTINUE;
+}
+
+static void fs_validate_keywords(VALUE kwargs, fs_mode_t mode) {
+    if (NIL_P(kwargs))
+        return;
+    if (!RB_TYPE_P(kwargs, T_HASH)) {
+        rb_raise(rb_eTypeError, "keywords must be a Hash");
+    }
+
+    rb_hash_foreach(kwargs, fs_validate_keyword_i, INT2FIX((int)mode));
+}
+
+static fs_options_t fs_parse_options(VALUE kwargs, fs_mode_t mode) {
+    fs_options_t opts;
+    VALUE id_value;
+    VALUE only_value;
+    VALUE on_invalid_value;
+    VALUE on_missing_id_value;
+    VALUE report_value;
+    VALUE max_errors_value;
+    VALUE geometry_index_value;
+    VALUE strategy_value;
+    VALUE predicate_value;
+    bool only_present = false;
+
+    memset(&opts, 0, sizeof(opts));
+    fs_validate_keywords(kwargs, mode);
+
+    id_value = fs_kwargs_value(kwargs, id_id, Qnil, NULL);
+    only_value = fs_kwargs_value(kwargs, id_only, Qnil, &only_present);
+    on_invalid_value = fs_kwargs_value(kwargs, id_on_invalid, ID2SYM(id_raise), NULL);
+    on_missing_id_value = fs_kwargs_value(kwargs, id_on_missing_id, ID2SYM(id_raise), NULL);
+    report_value = fs_kwargs_value(kwargs, id_report, Qfalse, NULL);
+    max_errors_value = fs_kwargs_value(kwargs, id_max_errors, INT2NUM(100), NULL);
+    geometry_index_value = fs_kwargs_value(kwargs, id_geometry_index, ID2SYM(id_ystripes), NULL);
+
+    opts.id_path = fs_normalize_id_path(id_value);
+    fs_parse_only_option(&opts, only_value, only_present);
+    opts.on_invalid = fs_parse_on_invalid(on_invalid_value);
+    opts.on_missing_id = fs_parse_on_missing_id(on_missing_id_value);
+    opts.report = fs_bool_option(report_value, "report:");
+    opts.max_errors = NUM2LONG(max_errors_value);
+    if (opts.max_errors < 0) {
+        rb_raise(eTGGeometryArgumentError, "max_errors: must be >= 0");
+    }
+    opts.geometry_index = parse_index_symbol(geometry_index_value);
+
+    if (opts.on_invalid == FS_ON_INVALID_SKIP && !opts.report) {
+        rb_raise(eTGGeometryArgumentError, "on_invalid: :skip requires report: true");
+    }
+    if (opts.on_missing_id == FS_ON_MISSING_ID_SKIP && !opts.report) {
+        rb_raise(eTGGeometryArgumentError, "on_missing_id: :skip requires report: true");
+    }
+
+    if (mode == FS_MODE_BUILD_INDEX) {
+        if (opts.report) {
+            rb_raise(eTGGeometryArgumentError, "build_index_* does not accept report: true");
+        }
+        strategy_value = fs_kwargs_value(kwargs, id_strategy, ID2SYM(id_rtree), NULL);
+        predicate_value = fs_kwargs_value(kwargs, id_predicate, ID2SYM(id_covers), NULL);
+        opts.strategy = parse_index_strategy_symbol(strategy_value);
+        opts.predicate = parse_index_predicate_symbol(predicate_value);
+    } else {
+        opts.strategy = TG_GEOMETRY_INDEX_STRATEGY_RTREE;
+        opts.predicate = TG_GEOMETRY_INDEX_PREDICATE_COVERS;
+    }
+
+    return opts;
+}
+
+static VALUE fs_tg_parse_error_message(struct tg_geom *geom) {
+    const char *err;
+    VALUE message;
+
+    if (!geom) {
+        rb_raise(rb_eNoMemError, "TG geometry allocation failed");
+    }
+
+    err = tg_geom_error(geom);
+    if (!err) {
+        return Qnil;
+    }
+
+    message = rb_str_new_cstr(err);
+    tg_geom_free(geom);
+    return message;
+}
+
+static bool fs_validate_geometry_or_error(struct json geometry, enum tg_index geometry_index,
+                                          VALUE *error_message) {
+    struct tg_geom *geom =
+        tg_parse_geojsonn_ix(json_raw(geometry), json_raw_length(geometry), geometry_index);
+    VALUE message = fs_tg_parse_error_message(geom);
+
+    if (!NIL_P(message)) {
+        *error_message = message;
+        return false;
+    }
+
+    tg_geom_free(geom);
+    return true;
+}
+
+static VALUE fs_missing_id_ordinal(long feature_index) {
+    return rb_sprintf("feature/%ld", feature_index);
+}
+
+static bool fs_extract_id(fs_source_t *source, fs_options_t *opts, struct json feature,
+                          long feature_index, VALUE *id_out, VALUE *error_message,
+                          bool materialize_id) {
+    struct json id_json;
+
+    if (!fs_json_get_path(feature, opts->id_path, &id_json) || json_type(id_json) == JSON_NULL) {
+        switch (opts->on_missing_id) {
+        case FS_ON_MISSING_ID_ORDINAL:
+            *id_out = materialize_id ? fs_missing_id_ordinal(feature_index) : Qnil;
+            return true;
+        case FS_ON_MISSING_ID_SKIP:
+            *error_message = rb_sprintf("missing id at configured path");
+            return false;
+        case FS_ON_MISSING_ID_RAISE:
+            fs_raise_argument_error(feature_index, fs_json_offset(source, feature),
+                                    "missing id at configured path");
+        }
+    }
+
+    if (!fs_id_from_json_value(id_json, id_out, error_message, materialize_id)) {
+        if (opts->on_invalid == FS_ON_INVALID_RAISE) {
+            fs_raise_argument_error(feature_index, fs_json_offset(source, id_json),
+                                    StringValueCStr(*error_message));
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static bool fs_feature_prepare(fs_source_t *source, fs_options_t *opts, fs_mode_t mode,
+                               struct json feature, long feature_index, bool materialize_id,
+                               fs_feature_result_t *result) {
+    struct json geometry;
+    struct json geometry_type;
+    struct json properties;
+    unsigned int geom_bit;
+    VALUE id = Qnil;
+    VALUE error_message = Qnil;
+
+    memset(result, 0, sizeof(*result));
+    result->feature = feature;
+    result->id = Qnil;
+    result->reason_value = Qnil;
+
+    if (!json_exists(feature) || json_type(feature) != JSON_OBJECT) {
+        result->reason = "feature is not an object";
+        return false;
+    }
+
+    geometry = json_object_get(feature, "geometry");
+    if (!json_exists(geometry) || json_type(geometry) == JSON_NULL) {
+        result->reason = "missing geometry";
+        return false;
+    }
+    if (json_type(geometry) != JSON_OBJECT) {
+        result->reason = "geometry must be an object";
+        return false;
+    }
+
+    geometry_type = json_object_get(geometry, "type");
+    if (!json_exists(geometry_type) || json_type(geometry_type) != JSON_STRING) {
+        result->reason = "geometry.type must be a string";
+        return false;
+    }
+
+    geom_bit = fs_geometry_type_bit(geometry_type);
+    if (geom_bit == 0) {
+        result->reason = "unsupported geometry.type";
+        return false;
+    }
+
+    if (!opts->only_all && (opts->only_mask & geom_bit) == 0) {
+        result->filtered = true;
+        return true;
+    }
+
+    if (!fs_extract_id(source, opts, feature, feature_index, &id, &error_message, materialize_id)) {
+        result->missing_id_skip = (opts->on_missing_id == FS_ON_MISSING_ID_SKIP);
+        result->reason_value = error_message;
+        return false;
+    }
+
+    if (mode == FS_MODE_READ_FEATURES) {
+        properties = json_object_get(feature, "properties");
+        if (!json_exists(properties) || json_type(properties) == JSON_NULL) {
+            /* returned as "null" */
+        } else if (json_type(properties) != JSON_OBJECT) {
+            result->reason = "properties must be an object or null";
+            return false;
+        }
+        result->properties = properties;
+    }
+
+    result->accepted = true;
+    result->id = id;
+    result->geometry = geometry;
+    return true;
+}
+
+static void fs_parse_root(fs_source_t *source, struct json *features_out) {
+    struct json_valid valid;
+    struct json root;
+    struct json type;
+    struct json features;
+
+    valid = json_validn_ex(source->data, source->len, 0);
+    if (!valid.valid) {
+        rb_raise(eTGGeometryParseError, "malformed JSON at byte %llu",
+                 (unsigned long long)valid.pos);
+    }
+
+    root = json_parsen(source->data, source->len);
+    if (!json_exists(root) || json_type(root) != JSON_OBJECT) {
+        rb_raise(eTGGeometryParseError, "GeoJSON root must be a FeatureCollection object");
+    }
+
+    type = json_object_get(root, "type");
+    if (!json_exists(type) || json_type(type) != JSON_STRING ||
+        json_string_compare(type, "FeatureCollection") != 0) {
+        rb_raise(eTGGeometryParseError, "GeoJSON root type must be FeatureCollection");
+    }
+
+    features = json_object_get(root, "features");
+    if (!json_exists(features) || json_type(features) != JSON_ARRAY) {
+        rb_raise(eTGGeometryParseError, "GeoJSON FeatureCollection features must be an Array");
+    }
+
+    *features_out = features;
+}
+
+static void fs_handle_invalid_or_raise(fs_source_t *source, fs_options_t *opts,
+                                       fs_feature_result_t *feature_result, long feature_index,
+                                       VALUE errors, long *skipped) {
+    size_t offset =
+        fs_json_offset(source, json_exists(feature_result->geometry) ? feature_result->geometry
+                                                                     : feature_result->feature);
+    VALUE reason =
+        !NIL_P(feature_result->reason_value)
+            ? feature_result->reason_value
+            : rb_str_new_cstr(feature_result->reason ? feature_result->reason : "invalid feature");
+
+    if (feature_result->missing_id_skip || opts->on_invalid == FS_ON_INVALID_SKIP) {
+        (*skipped)++;
+        fs_report_error(errors, opts->max_errors, feature_index, offset, reason);
+        return;
+    }
+
+    fs_raise_parse_error_value(feature_index, offset, reason);
+}
+
+static VALUE fs_properties_json_string(struct json properties) {
+    if (!json_exists(properties) || json_type(properties) == JSON_NULL) {
+        return fs_cstr_utf8_string("null");
+    }
+
+    return fs_utf8_string(json_raw(properties), json_raw_length(properties));
+}
+
+/*
+ * FeatureSource safe bulk executor.
+ *
+ * Heavy source traversal and TG geometry parsing run without GVL. The worker
+ * phase stores only C-owned data and json.c ranges backed by the owned source
+ * buffer. Ruby VALUE ids/strings/arrays and rb_gc_adjust_memory_usage are only
+ * created/called again after the GVL is restored.
+ */
+typedef enum {
+    FS_SAFE_ERROR_NONE,
+    FS_SAFE_ERROR_NOMEM,
+    FS_SAFE_ERROR_PARSE,
+    FS_SAFE_ERROR_ARGUMENT,
+    FS_SAFE_ERROR_SYSTEM,
+} fs_safe_error_type_t;
+
+typedef enum {
+    FS_SAFE_ID_STRING,
+    FS_SAFE_ID_INTEGER,
+    FS_SAFE_ID_ORDINAL,
+} fs_safe_id_kind_t;
+
+typedef struct {
+    fs_safe_id_kind_t kind;
+    struct json json_value;
+    long long integer_value;
+    long feature_index;
+} fs_safe_id_t;
+
+typedef struct {
+    fs_safe_id_t id;
+    struct json geometry;
+    struct json properties;
+    bool properties_null;
+} fs_safe_row_t;
+
+typedef struct {
+    fs_safe_id_t id;
+    struct tg_geom *geom;
+    struct tg_rect bbox;
+    size_t geom_bytes;
+    long ordinal;
+} fs_safe_native_entry_t;
+
+typedef struct {
+    long feature_index;
+    size_t byte_offset;
+    char *reason;
+} fs_safe_report_error_t;
+
+typedef struct {
+    fs_safe_error_type_t type;
+    int sys_errno;
+    long feature_index;
+    size_t byte_offset;
+    char *message;
+} fs_safe_error_t;
+
+typedef struct {
+    char **keys;
+    size_t *lens;
+    long len;
+    bool only_all;
+    unsigned int only_mask;
+    fs_on_invalid_t on_invalid;
+    fs_on_missing_id_t on_missing_id;
+    bool report;
+    long max_errors;
+    enum tg_index geometry_index;
+    enum tg_geometry_index_strategy strategy;
+    enum tg_geometry_index_predicate predicate;
+} fs_safe_options_t;
+
+typedef struct {
+    fs_mode_t mode;
+    fs_safe_options_t opts;
+
+    char *path;
+    char *source_data;
+    size_t source_len;
+    bool source_ruby_alloc;
+
+    fs_safe_row_t *rows;
+    long row_len;
+    long row_cap;
+
+    fs_safe_native_entry_t *entries;
+    long entry_len;
+
+    long skipped;
+    long filtered;
+    fs_safe_report_error_t *errors;
+    long errors_len;
+    long errors_cap;
+
+    fs_safe_error_t fatal;
+} fs_safe_job_t;
+
+typedef struct {
+    fs_safe_job_t *job;
+    VALUE result;
+} fs_safe_materialize_args_t;
+
+static char *fs_safe_strdup_len(const char *ptr, size_t len) {
+    char *copy;
+
+    if (len > SIZE_MAX - 1)
+        return NULL;
+    copy = (char *)malloc(len + 1);
+    if (!copy)
+        return NULL;
+    if (len > 0)
+        memcpy(copy, ptr, len);
+    copy[len] = '\0';
+    return copy;
+}
+
+static char *fs_safe_strdup_cstr(const char *ptr) {
+    return fs_safe_strdup_len(ptr ? ptr : "", strlen(ptr ? ptr : ""));
+}
+
+static char *fs_safe_format_feature_message(long feature_index, size_t byte_offset,
+                                            const char *reason) {
+    const char *r = reason ? reason : "invalid feature";
+    int n = snprintf(NULL, 0, "feature %ld at byte %llu: %s", feature_index,
+                     (unsigned long long)byte_offset, r);
+    char *buf;
+
+    if (n < 0)
+        return NULL;
+    buf = (char *)malloc((size_t)n + 1);
+    if (!buf)
+        return NULL;
+    snprintf(buf, (size_t)n + 1, "feature %ld at byte %llu: %s", feature_index,
+             (unsigned long long)byte_offset, r);
+    return buf;
+}
+
+static void fs_safe_set_error(fs_safe_job_t *job, fs_safe_error_type_t type, const char *message) {
+    if (job->fatal.type != FS_SAFE_ERROR_NONE)
+        return;
+    job->fatal.type = type;
+    job->fatal.message = fs_safe_strdup_cstr(message);
+    if (!job->fatal.message && type != FS_SAFE_ERROR_NOMEM) {
+        job->fatal.type = FS_SAFE_ERROR_NOMEM;
+    }
+}
+
+static void fs_safe_set_system_error(fs_safe_job_t *job, int err) {
+    if (job->fatal.type != FS_SAFE_ERROR_NONE)
+        return;
+    job->fatal.type = FS_SAFE_ERROR_SYSTEM;
+    job->fatal.sys_errno = err;
+}
+
+static void fs_safe_set_feature_error(fs_safe_job_t *job, fs_safe_error_type_t type,
+                                      long feature_index, size_t byte_offset, const char *reason) {
+    if (job->fatal.type != FS_SAFE_ERROR_NONE)
+        return;
+    job->fatal.type = type;
+    job->fatal.feature_index = feature_index;
+    job->fatal.byte_offset = byte_offset;
+    job->fatal.message = fs_safe_format_feature_message(feature_index, byte_offset, reason);
+    if (!job->fatal.message && type != FS_SAFE_ERROR_NOMEM) {
+        job->fatal.type = FS_SAFE_ERROR_NOMEM;
+    }
+}
+
+static bool fs_safe_add_report_error(fs_safe_job_t *job, long feature_index, size_t byte_offset,
+                                     const char *reason) {
+    fs_safe_report_error_t *grown;
+
+    if (job->errors_len >= job->opts.max_errors)
+        return true;
+
+    if (job->errors_len == job->errors_cap) {
+        long new_cap = job->errors_cap == 0 ? 8 : job->errors_cap * 2;
+        if (new_cap < job->errors_cap || (size_t)new_cap > SIZE_MAX / sizeof(*job->errors)) {
+            fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource report allocation overflow");
+            return false;
+        }
+        grown =
+            (fs_safe_report_error_t *)realloc(job->errors, (size_t)new_cap * sizeof(*job->errors));
+        if (!grown) {
+            fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource report allocation failed");
+            return false;
+        }
+        job->errors = grown;
+        job->errors_cap = new_cap;
+    }
+
+    job->errors[job->errors_len].feature_index = feature_index;
+    job->errors[job->errors_len].byte_offset = byte_offset;
+    job->errors[job->errors_len].reason = fs_safe_strdup_cstr(reason ? reason : "invalid feature");
+    if (!job->errors[job->errors_len].reason) {
+        fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM,
+                          "FeatureSource report reason allocation failed");
+        return false;
+    }
+    job->errors_len++;
+    return true;
+}
+
+static size_t fs_safe_json_offset(fs_safe_job_t *job, struct json value) {
+    const char *raw = json_raw(value);
+
+    if (!raw || !job->source_data || raw < job->source_data ||
+        raw > job->source_data + job->source_len)
+        return 0;
+    return (size_t)(raw - job->source_data);
+}
+
+static bool fs_safe_json_get_path(struct json root, fs_safe_options_t *opts, struct json *out) {
+    struct json cur = root;
+
+    for (long i = 0; i < opts->len; i++) {
+        if (!json_exists(cur) || json_type(cur) != JSON_OBJECT)
+            return false;
+        cur = json_object_getn(cur, opts->keys[i], opts->lens[i]);
+        if (!json_exists(cur))
+            return false;
+    }
+
+    *out = cur;
+    return true;
+}
+
+static unsigned int fs_safe_geometry_type_bit(struct json type_value) {
+    if (!json_exists(type_value) || json_type(type_value) != JSON_STRING)
+        return 0;
+    if (json_string_compare(type_value, "Point") == 0)
+        return FS_GEOM_POINT;
+    if (json_string_compare(type_value, "LineString") == 0)
+        return FS_GEOM_LINESTRING;
+    if (json_string_compare(type_value, "Polygon") == 0)
+        return FS_GEOM_POLYGON;
+    if (json_string_compare(type_value, "MultiPoint") == 0)
+        return FS_GEOM_MULTIPOINT;
+    if (json_string_compare(type_value, "MultiLineString") == 0)
+        return FS_GEOM_MULTILINESTRING;
+    if (json_string_compare(type_value, "MultiPolygon") == 0)
+        return FS_GEOM_MULTIPOLYGON;
+    if (json_string_compare(type_value, "GeometryCollection") == 0)
+        return FS_GEOM_GEOMETRYCOLLECTION;
+    return 0;
+}
+
+static bool fs_safe_json_number_is_integer(struct json value) {
+    const char *raw = json_raw(value);
+    size_t len = json_raw_length(value);
+
+    if (!raw || len == 0)
+        return false;
+    for (size_t i = 0; i < len; i++) {
+        if (raw[i] == '.' || raw[i] == 'e' || raw[i] == 'E')
+            return false;
+    }
+    return true;
+}
+
+static bool fs_safe_parse_integer_id(struct json value, long long *out, const char **reason) {
+    const char *raw = json_raw(value);
+    size_t len = json_raw_length(value);
+    char stack[64];
+    char *buf = stack;
+    char *endp = NULL;
+    long long parsed;
+    bool ok;
+
+    if (!fs_safe_json_number_is_integer(value)) {
+        *reason = "invalid id: numeric id must be an integer";
+        return false;
+    }
+
+    if (len >= sizeof(stack)) {
+        buf = fs_safe_strdup_len(raw, len);
+        if (!buf) {
+            *reason = "id buffer allocation failed";
+            return false;
+        }
+    } else {
+        memcpy(buf, raw, len);
+        buf[len] = '\0';
+    }
+
+    errno = 0;
+    parsed = strtoll(buf, &endp, 10);
+    ok = (errno == 0 && endp == buf + len);
+    if (buf != stack)
+        free(buf);
+
+    if (!ok) {
+        *reason = "invalid id: integer is out of range";
+        return false;
+    }
+
+    *out = parsed;
+    return true;
+}
+
+static bool fs_safe_extract_id(fs_safe_job_t *job, struct json feature, long feature_index,
+                               fs_safe_id_t *id_out, const char **reason, bool *missing_id_skip,
+                               bool *argument_error) {
+    struct json id_json;
+
+    *missing_id_skip = false;
+    *argument_error = false;
+
+    if (!fs_safe_json_get_path(feature, &job->opts, &id_json) || json_type(id_json) == JSON_NULL) {
+        switch (job->opts.on_missing_id) {
+        case FS_ON_MISSING_ID_ORDINAL:
+            id_out->kind = FS_SAFE_ID_ORDINAL;
+            id_out->feature_index = feature_index;
+            return true;
+        case FS_ON_MISSING_ID_SKIP:
+            *reason = "missing id at configured path";
+            *missing_id_skip = true;
+            return false;
+        case FS_ON_MISSING_ID_RAISE:
+            *reason = "missing id at configured path";
+            *argument_error = true;
+            return false;
+        }
+    }
+
+    switch (json_type(id_json)) {
+    case JSON_STRING:
+        id_out->kind = FS_SAFE_ID_STRING;
+        id_out->json_value = id_json;
+        id_out->feature_index = feature_index;
+        return true;
+    case JSON_NUMBER: {
+        long long parsed = 0;
+        if (!fs_safe_parse_integer_id(id_json, &parsed, reason)) {
+            *argument_error = (job->opts.on_invalid == FS_ON_INVALID_RAISE);
+            return false;
+        }
+        id_out->kind = FS_SAFE_ID_INTEGER;
+        id_out->integer_value = parsed;
+        id_out->feature_index = feature_index;
+        return true;
+    }
+    default:
+        *reason = "invalid id: expected JSON string or integer number";
+        *argument_error = (job->opts.on_invalid == FS_ON_INVALID_RAISE);
+        return false;
+    }
+}
+
+typedef struct {
+    bool accepted;
+    bool filtered;
+    bool missing_id_skip;
+    bool argument_error;
+    fs_safe_id_t id;
+    struct json feature;
+    struct json geometry;
+    struct json properties;
+    bool properties_null;
+    const char *reason;
+} fs_safe_feature_t;
+
+static bool fs_safe_prepare_feature(fs_safe_job_t *job, struct json feature, long feature_index,
+                                    fs_mode_t mode, fs_safe_feature_t *out) {
+    struct json geometry;
+    struct json geometry_type;
+    struct json properties;
+    unsigned int geom_bit;
+
+    memset(out, 0, sizeof(*out));
+    out->feature = feature;
+
+    if (!json_exists(feature) || json_type(feature) != JSON_OBJECT) {
+        out->reason = "feature is not an object";
+        return false;
+    }
+
+    geometry = json_object_get(feature, "geometry");
+    if (!json_exists(geometry) || json_type(geometry) == JSON_NULL) {
+        out->reason = "missing geometry";
+        return false;
+    }
+    if (json_type(geometry) != JSON_OBJECT) {
+        out->reason = "geometry must be an object";
+        return false;
+    }
+
+    geometry_type = json_object_get(geometry, "type");
+    if (!json_exists(geometry_type) || json_type(geometry_type) != JSON_STRING) {
+        out->reason = "geometry.type must be a string";
+        return false;
+    }
+
+    geom_bit = fs_safe_geometry_type_bit(geometry_type);
+    if (geom_bit == 0) {
+        out->reason = "unsupported geometry.type";
+        return false;
+    }
+
+    if (!job->opts.only_all && (job->opts.only_mask & geom_bit) == 0) {
+        out->filtered = true;
+        return true;
+    }
+
+    if (!fs_safe_extract_id(job, feature, feature_index, &out->id, &out->reason,
+                            &out->missing_id_skip, &out->argument_error)) {
+        return false;
+    }
+
+    if (mode == FS_MODE_READ_FEATURES) {
+        properties = json_object_get(feature, "properties");
+        if (!json_exists(properties) || json_type(properties) == JSON_NULL) {
+            out->properties_null = true;
+        } else if (json_type(properties) != JSON_OBJECT) {
+            out->reason = "properties must be an object or null";
+            return false;
+        } else {
+            out->properties = properties;
+        }
+    }
+
+    out->accepted = true;
+    out->geometry = geometry;
+    return true;
+}
+
+static bool fs_safe_handle_invalid(fs_safe_job_t *job, fs_safe_feature_t *feature,
+                                   long feature_index) {
+    size_t offset = fs_safe_json_offset(job, json_exists(feature->geometry) ? feature->geometry
+                                                                            : feature->feature);
+    const char *reason = feature->reason ? feature->reason : "invalid feature";
+
+    if (feature->missing_id_skip ||
+        (!feature->argument_error && job->opts.on_invalid == FS_ON_INVALID_SKIP)) {
+        job->skipped++;
+        if (!fs_safe_add_report_error(job, feature_index, offset, reason))
+            return false;
+        return true;
+    }
+
+    fs_safe_set_feature_error(
+        job, feature->argument_error ? FS_SAFE_ERROR_ARGUMENT : FS_SAFE_ERROR_PARSE, feature_index,
+        offset, reason);
+    return false;
+}
+
+static bool fs_safe_parse_root(fs_safe_job_t *job, struct json *features_out) {
+    struct json_valid valid;
+    struct json root;
+    struct json type;
+    struct json features;
+
+    valid = json_validn_ex(job->source_data, job->source_len, 0);
+    if (!valid.valid) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "malformed JSON at byte %llu", (unsigned long long)valid.pos);
+        fs_safe_set_error(job, FS_SAFE_ERROR_PARSE, msg);
+        return false;
+    }
+
+    root = json_parsen(job->source_data, job->source_len);
+    if (!json_exists(root) || json_type(root) != JSON_OBJECT) {
+        fs_safe_set_error(job, FS_SAFE_ERROR_PARSE,
+                          "GeoJSON root must be a FeatureCollection object");
+        return false;
+    }
+
+    type = json_object_get(root, "type");
+    if (!json_exists(type) || json_type(type) != JSON_STRING ||
+        json_string_compare(type, "FeatureCollection") != 0) {
+        fs_safe_set_error(job, FS_SAFE_ERROR_PARSE, "GeoJSON root type must be FeatureCollection");
+        return false;
+    }
+
+    features = json_object_get(root, "features");
+    if (!json_exists(features) || json_type(features) != JSON_ARRAY) {
+        fs_safe_set_error(job, FS_SAFE_ERROR_PARSE,
+                          "GeoJSON FeatureCollection features must be an Array");
+        return false;
+    }
+
+    *features_out = features;
+    return true;
+}
+
+static char *fs_safe_tg_error_message(struct tg_geom *geom) {
+    const char *err;
+    char *msg;
+    int n;
+
+    if (!geom)
+        return fs_safe_strdup_cstr("TG geometry allocation failed");
+    err = tg_geom_error(geom);
+    if (!err)
+        return NULL;
+    n = snprintf(NULL, 0, "invalid geometry: %s", err);
+    if (n < 0)
+        return NULL;
+    msg = (char *)malloc((size_t)n + 1);
+    if (!msg)
+        return NULL;
+    snprintf(msg, (size_t)n + 1, "invalid geometry: %s", err);
+    return msg;
+}
+
+static bool fs_safe_validate_geometry(fs_safe_job_t *job, struct json geometry, long feature_index,
+                                      bool *skipped_out) {
+    *skipped_out = false;
+    struct tg_geom *geom = tg_parse_geojsonn_ix(json_raw(geometry), json_raw_length(geometry),
+                                                job->opts.geometry_index);
+    char *message = fs_safe_tg_error_message(geom);
+
+    if (!geom) {
+        fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "TG geometry allocation failed");
+        return false;
+    }
+
+    if (message) {
+        if (job->opts.on_invalid == FS_ON_INVALID_SKIP) {
+            job->skipped++;
+            bool ok = fs_safe_add_report_error(job, feature_index,
+                                               fs_safe_json_offset(job, geometry), message);
+            free(message);
+            tg_geom_free(geom);
+            *skipped_out = true;
+            return ok;
+        }
+        fs_safe_set_feature_error(job, FS_SAFE_ERROR_PARSE, feature_index,
+                                  fs_safe_json_offset(job, geometry), message);
+        free(message);
+        tg_geom_free(geom);
+        return false;
+    }
+
+    tg_geom_free(geom);
+    return true;
+}
+
+static bool fs_safe_append_row(fs_safe_job_t *job, fs_safe_feature_t *feature) {
+    fs_safe_row_t *grown;
+    long new_cap;
+
+    if (job->row_len == job->row_cap) {
+        new_cap = job->row_cap == 0 ? 64 : job->row_cap * 2;
+        if (new_cap < job->row_cap || (size_t)new_cap > SIZE_MAX / sizeof(*job->rows)) {
+            fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource rows allocation overflow");
+            return false;
+        }
+        grown = (fs_safe_row_t *)realloc(job->rows, (size_t)new_cap * sizeof(*job->rows));
+        if (!grown) {
+            fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource rows allocation failed");
+            return false;
+        }
+        job->rows = grown;
+        job->row_cap = new_cap;
+    }
+
+    memset(&job->rows[job->row_len], 0, sizeof(job->rows[job->row_len]));
+    job->rows[job->row_len].id = feature->id;
+    job->rows[job->row_len].geometry = feature->geometry;
+    job->rows[job->row_len].properties = feature->properties;
+    job->rows[job->row_len].properties_null = feature->properties_null;
+    job->row_len++;
+    return true;
+}
+
+static bool fs_safe_run_read(fs_safe_job_t *job, struct json features) {
+    struct json feature;
+    long feature_index = 0;
+
+    for (feature = json_first(features); json_exists(feature);
+         feature = json_next(feature), feature_index++) {
+        fs_safe_feature_t prepared;
+
+        if (!fs_safe_prepare_feature(job, feature, feature_index, job->mode, &prepared)) {
+            if (!fs_safe_handle_invalid(job, &prepared, feature_index))
+                return false;
+            continue;
+        }
+
+        if (prepared.filtered) {
+            job->filtered++;
+            continue;
+        }
+
+        {
+            bool geometry_skipped = false;
+            if (!fs_safe_validate_geometry(job, prepared.geometry, feature_index,
+                                           &geometry_skipped))
+                return false;
+            if (geometry_skipped)
+                continue;
+        }
+
+        if (!fs_safe_append_row(job, &prepared))
+            return false;
+    }
+
+    return true;
+}
+
+static bool fs_safe_count_build(fs_safe_job_t *job, struct json features, long *accepted_out) {
+    struct json feature;
+    long feature_index = 0;
+    long accepted = 0;
+
+    for (feature = json_first(features); json_exists(feature);
+         feature = json_next(feature), feature_index++) {
+        fs_safe_feature_t prepared;
+
+        if (!fs_safe_prepare_feature(job, feature, feature_index, FS_MODE_BUILD_INDEX, &prepared)) {
+            if (!fs_safe_handle_invalid(job, &prepared, feature_index))
+                return false;
+            continue;
+        }
+
+        if (prepared.filtered) {
+            job->filtered++;
+            continue;
+        }
+        if (prepared.accepted)
+            accepted++;
+    }
+
+    *accepted_out = accepted;
+    return true;
+}
+
+static bool fs_safe_fill_build(fs_safe_job_t *job, struct json features) {
+    struct json feature;
+    long feature_index = 0;
+    long ordinal = 0;
+
+    for (feature = json_first(features); json_exists(feature);
+         feature = json_next(feature), feature_index++) {
+        fs_safe_feature_t prepared;
+        struct tg_geom *geom;
+        char *message;
+
+        if (!fs_safe_prepare_feature(job, feature, feature_index, FS_MODE_BUILD_INDEX, &prepared)) {
+            if (!fs_safe_handle_invalid(job, &prepared, feature_index))
+                return false;
+            continue;
+        }
+        if (prepared.filtered || !prepared.accepted)
+            continue;
+
+        geom = tg_parse_geojsonn_ix(json_raw(prepared.geometry), json_raw_length(prepared.geometry),
+                                    job->opts.geometry_index);
+        message = fs_safe_tg_error_message(geom);
+        if (!geom) {
+            fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "TG geometry allocation failed");
+            return false;
+        }
+        if (message) {
+            fs_safe_set_feature_error(job, FS_SAFE_ERROR_PARSE, feature_index,
+                                      fs_safe_json_offset(job, prepared.geometry), message);
+            free(message);
+            tg_geom_free(geom);
+            return false;
+        }
+
+        job->entries[ordinal].id = prepared.id;
+        job->entries[ordinal].geom = geom;
+        job->entries[ordinal].bbox = tg_geom_rect(geom);
+        job->entries[ordinal].geom_bytes = tg_geom_memsize(geom);
+        job->entries[ordinal].ordinal = ordinal;
+        ordinal++;
+    }
+
+    job->entry_len = ordinal;
+    return true;
+}
+
+static bool fs_safe_read_file_no_gvl(fs_safe_job_t *job) {
+    int fd;
+    struct stat st;
+    char *buf = NULL;
+    size_t cap = 0;
+    size_t len = 0;
+
+    fd = open(job->path, O_RDONLY);
+    if (fd < 0) {
+        fs_safe_set_system_error(job, errno);
+        return false;
+    }
+
+    if (fstat(fd, &st) == 0 && st.st_size >= 0) {
+        cap = (size_t)st.st_size;
+        if (cap > SIZE_MAX - 1) {
+            close(fd);
+            fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource file is too large");
+            return false;
+        }
+        buf = (char *)malloc(cap + 1);
+        if (!buf) {
+            close(fd);
+            fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource file allocation failed");
+            return false;
+        }
+    } else {
+        cap = 8192;
+        buf = (char *)malloc(cap + 1);
+        if (!buf) {
+            close(fd);
+            fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource file allocation failed");
+            return false;
+        }
+    }
+
+    for (;;) {
+        ssize_t n;
+        if (len == cap) {
+            size_t new_cap = cap < 8192 ? 8192 : cap * 2;
+            char *grown;
+            if (new_cap < cap || new_cap > SIZE_MAX - 1) {
+                free(buf);
+                close(fd);
+                fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM,
+                                  "FeatureSource file allocation overflow");
+                return false;
+            }
+            grown = (char *)realloc(buf, new_cap + 1);
+            if (!grown) {
+                free(buf);
+                close(fd);
+                fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource file allocation failed");
+                return false;
+            }
+            buf = grown;
+            cap = new_cap;
+        }
+
+        n = read(fd, buf + len, cap - len);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            int err = errno;
+            free(buf);
+            close(fd);
+            fs_safe_set_system_error(job, err);
+            return false;
+        }
+        if (n == 0)
+            break;
+        len += (size_t)n;
+    }
+
+    if (close(fd) != 0) {
+        int err = errno;
+        free(buf);
+        fs_safe_set_system_error(job, err);
+        return false;
+    }
+
+    buf[len] = '\0';
+    job->source_data = buf;
+    job->source_len = len;
+    job->source_ruby_alloc = false;
+    return true;
+}
+
+static void *fs_safe_run_no_gvl(void *ptr) {
+    fs_safe_job_t *job = (fs_safe_job_t *)ptr;
+    struct json features;
+
+    if (job->path && !job->source_data) {
+        if (!fs_safe_read_file_no_gvl(job))
+            return NULL;
+    }
+
+    if (!fs_safe_parse_root(job, &features))
+        return NULL;
+
+    if (job->mode == FS_MODE_BUILD_INDEX) {
+        long accepted = 0;
+        if (!fs_safe_count_build(job, features, &accepted))
+            return NULL;
+        if (accepted > 0) {
+            if ((size_t)accepted > SIZE_MAX / sizeof(*job->entries)) {
+                fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM,
+                                  "FeatureSource entries allocation overflow");
+                return NULL;
+            }
+            job->entries =
+                (fs_safe_native_entry_t *)calloc((size_t)accepted, sizeof(*job->entries));
+            if (!job->entries) {
+                fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM,
+                                  "FeatureSource entries allocation failed");
+                return NULL;
+            }
+        }
+        if (!fs_safe_fill_build(job, features))
+            return NULL;
+    } else {
+        if (!fs_safe_run_read(job, features))
+            return NULL;
+    }
+
+    return NULL;
+}
+
+typedef struct {
+    void *(*func)(void *);
+    void *arg;
+    size_t arg_size;
+    VALUE thread;
+    VALUE scheduler;
+    VALUE fiber;
+    VALUE blocker;
+} fs_safe_worker_t;
+
+static VALUE fs_current_fiber_scheduler(void) {
+#if defined(HAVE_RB_FIBER_SCHEDULER_CURRENT)
+    VALUE scheduler = rb_fiber_scheduler_current();
+    if (scheduler == Qnil || scheduler == Qfalse)
+        return Qnil;
+    return scheduler;
+#else
+    return Qnil;
+#endif
+}
+
+static void fs_safe_worker_mark(void *ptr) {
+    fs_safe_worker_t *worker = (fs_safe_worker_t *)ptr;
+    if (!worker)
+        return;
+    rb_gc_mark(worker->thread);
+    rb_gc_mark(worker->scheduler);
+    rb_gc_mark(worker->fiber);
+    rb_gc_mark(worker->blocker);
+}
+
+static void fs_safe_worker_free(void *ptr) {
+    fs_safe_worker_t *worker = (fs_safe_worker_t *)ptr;
+    if (!worker)
+        return;
+    ruby_xfree(worker->arg);
+    ruby_xfree(worker);
+}
+
+static size_t fs_safe_worker_memsize(const void *ptr) {
+    const fs_safe_worker_t *worker = (const fs_safe_worker_t *)ptr;
+    return sizeof(fs_safe_worker_t) + (worker ? worker->arg_size : 0);
+}
+
+static const rb_data_type_t fs_safe_worker_type = {
+    "TG::Geometry::FeatureSource/Worker",
+    {fs_safe_worker_mark, fs_safe_worker_free, fs_safe_worker_memsize, NULL, {0}},
+    0,
+    0,
+    RUBY_TYPED_FREE_IMMEDIATELY};
+
+static VALUE fs_safe_worker_new(void *(*func)(void *), const void *arg, size_t arg_size) {
+    fs_safe_worker_t *worker;
+    VALUE wrapper =
+        TypedData_Make_Struct(rb_cObject, fs_safe_worker_t, &fs_safe_worker_type, worker);
+
+    memset(worker, 0, sizeof(*worker));
+    worker->func = func;
+    worker->arg_size = arg_size;
+    worker->thread = Qnil;
+    worker->scheduler = Qnil;
+    worker->fiber = Qnil;
+    worker->blocker = Qnil;
+
+    if (arg_size > 0) {
+        worker->arg = ruby_xmalloc(arg_size);
+        memcpy(worker->arg, arg, arg_size);
+    }
+
+    return wrapper;
+}
+
+static void *fs_safe_worker_nogvl(void *arg) {
+    fs_safe_worker_t *worker = (fs_safe_worker_t *)arg;
+    worker->func(worker->arg);
+    return NULL;
+}
+
+static VALUE fs_safe_worker_thread(void *arg) {
+    fs_safe_worker_t *worker = (fs_safe_worker_t *)arg;
+    rb_thread_call_without_gvl(fs_safe_worker_nogvl, worker, RUBY_UBF_IO, NULL);
+#if defined(HAVE_RB_FIBER_SCHEDULER_CURRENT)
+    if (!NIL_P(worker->scheduler) && !NIL_P(worker->fiber) && !NIL_P(worker->blocker))
+        rb_fiber_scheduler_unblock(worker->scheduler, worker->blocker, worker->fiber);
+#endif
+    return Qnil;
+}
+
+static VALUE fs_safe_worker_wait(VALUE wrapper) {
+    fs_safe_worker_t *worker;
+    TypedData_Get_Struct(wrapper, fs_safe_worker_t, &fs_safe_worker_type, worker);
+
+    worker->scheduler = fs_current_fiber_scheduler();
+#if defined(HAVE_RB_FIBER_SCHEDULER_CURRENT)
+    if (!NIL_P(worker->scheduler)) {
+        worker->fiber = rb_fiber_current();
+        worker->blocker = wrapper;
+        worker->thread = rb_thread_create(fs_safe_worker_thread, worker);
+        rb_fiber_scheduler_block(worker->scheduler, worker->blocker, Qnil);
+        rb_funcall(worker->thread, id_join, 0);
+        return Qnil;
+    }
+#endif
+
+    worker->thread = rb_thread_create(fs_safe_worker_thread, worker);
+    rb_funcall(worker->thread, id_join, 0);
+    return Qnil;
+}
+
+static VALUE fs_safe_worker_join_ensure(VALUE wrapper) {
+    fs_safe_worker_t *worker;
+    TypedData_Get_Struct(wrapper, fs_safe_worker_t, &fs_safe_worker_type, worker);
+
+    if (!NIL_P(worker->thread))
+        rb_funcall(worker->thread, id_join, 0);
+    return Qnil;
+}
+
+static void fs_safe_run_via_scheduler_worker(fs_safe_job_t *job) {
+    VALUE wrapper = fs_safe_worker_new(fs_safe_run_no_gvl, job, sizeof(*job));
+    fs_safe_worker_t *worker;
+
+    rb_ensure(fs_safe_worker_wait, wrapper, fs_safe_worker_join_ensure, wrapper);
+
+    TypedData_Get_Struct(wrapper, fs_safe_worker_t, &fs_safe_worker_type, worker);
+    memcpy(job, worker->arg, sizeof(*job));
+    RB_GC_GUARD(wrapper);
+}
+
+static void fs_safe_run_without_gvl(fs_safe_job_t *job) {
+    if (!NIL_P(fs_current_fiber_scheduler())) {
+        fs_safe_run_via_scheduler_worker(job);
+        return;
+    }
+
+#if defined(HAVE_RB_NOGVL_OFFLOAD_SAFE)
+    rb_nogvl(fs_safe_run_no_gvl, job, RUBY_UBF_IO, NULL, RB_NOGVL_OFFLOAD_SAFE);
+#else
+    rb_thread_call_without_gvl(fs_safe_run_no_gvl, job, RUBY_UBF_IO, NULL);
+#endif
+}
+
+static void fs_safe_free_c_options(fs_safe_options_t *opts) {
+    if (!opts)
+        return;
+    if (opts->keys) {
+        for (long i = 0; i < opts->len; i++) {
+            free(opts->keys[i]);
+        }
+        free(opts->keys);
+        opts->keys = NULL;
+    }
+    free(opts->lens);
+    opts->lens = NULL;
+    opts->len = 0;
+}
+
+static void fs_safe_cleanup(fs_safe_job_t *job) {
+    if (!job)
+        return;
+
+    if (job->entries) {
+        for (long i = 0; i < job->entry_len; i++) {
+            if (job->entries[i].geom) {
+                tg_geom_free(job->entries[i].geom);
+                job->entries[i].geom = NULL;
+            }
+        }
+        free(job->entries);
+        job->entries = NULL;
+        job->entry_len = 0;
+    }
+
+    free(job->rows);
+    job->rows = NULL;
+    job->row_len = 0;
+    job->row_cap = 0;
+
+    if (job->errors) {
+        for (long i = 0; i < job->errors_len; i++) {
+            free(job->errors[i].reason);
+        }
+        free(job->errors);
+        job->errors = NULL;
+        job->errors_len = 0;
+        job->errors_cap = 0;
+    }
+
+    if (job->source_data) {
+        if (job->source_ruby_alloc)
+            ruby_xfree(job->source_data);
+        else
+            free(job->source_data);
+        job->source_data = NULL;
+        job->source_len = 0;
+    }
+
+    free(job->path);
+    job->path = NULL;
+    free(job->fatal.message);
+    job->fatal.message = NULL;
+    fs_safe_free_c_options(&job->opts);
+}
+
+static VALUE fs_safe_job_ensure(VALUE arg) {
+    fs_safe_job_t *job = (fs_safe_job_t *)arg;
+    fs_safe_cleanup(job);
+    return Qnil;
+}
+
+static VALUE fs_safe_id_to_value(fs_safe_id_t *id) {
+    switch (id->kind) {
+    case FS_SAFE_ID_STRING:
+        return fs_copy_json_string_value(id->json_value);
+    case FS_SAFE_ID_INTEGER:
+        return LL2NUM(id->integer_value);
+    case FS_SAFE_ID_ORDINAL:
+        return fs_missing_id_ordinal(id->feature_index);
+    }
+    return Qnil;
+}
+
+static VALUE fs_safe_properties_to_value(fs_safe_row_t *row) {
+    if (row->properties_null || !json_exists(row->properties))
+        return fs_cstr_utf8_string("null");
+    return fs_utf8_string(json_raw(row->properties), json_raw_length(row->properties));
+}
+
+static void fs_safe_raise_fatal(fs_safe_job_t *job) {
+    switch (job->fatal.type) {
+    case FS_SAFE_ERROR_NONE:
+        return;
+    case FS_SAFE_ERROR_NOMEM:
+        rb_raise(rb_eNoMemError, "%s",
+                 job->fatal.message ? job->fatal.message : "FeatureSource allocation failed");
+    case FS_SAFE_ERROR_PARSE:
+        rb_raise(eTGGeometryParseError, "%s",
+                 job->fatal.message ? job->fatal.message : "FeatureSource parse error");
+    case FS_SAFE_ERROR_ARGUMENT:
+        rb_raise(eTGGeometryArgumentError, "%s",
+                 job->fatal.message ? job->fatal.message : "FeatureSource argument error");
+    case FS_SAFE_ERROR_SYSTEM:
+        rb_syserr_fail(job->fatal.sys_errno, job->path ? job->path : "FeatureSource file read");
+    }
+}
+
+static VALUE fs_safe_materialize_rows(fs_safe_job_t *job) {
+    VALUE rows = rb_ary_new_capa(job->row_len);
+
+    for (long i = 0; i < job->row_len; i++) {
+        VALUE id = fs_safe_id_to_value(&job->rows[i].id);
+        VALUE geom_json =
+            fs_utf8_string(json_raw(job->rows[i].geometry), json_raw_length(job->rows[i].geometry));
+        if (job->mode == FS_MODE_READ_ENTRIES) {
+            rb_ary_push(rows, rb_ary_new_from_args(2, id, geom_json));
+        } else {
+            VALUE props_json = fs_safe_properties_to_value(&job->rows[i]);
+            rb_ary_push(rows, rb_ary_new_from_args(3, id, geom_json, props_json));
+        }
+    }
+
+    if (job->opts.report) {
+        VALUE report = rb_hash_new();
+        VALUE errors = rb_ary_new_capa(job->errors_len);
+        for (long i = 0; i < job->errors_len; i++) {
+            VALUE reason = fs_cstr_utf8_string(job->errors[i].reason);
+            rb_ary_push(errors, fs_error_hash(job->errors[i].feature_index,
+                                              job->errors[i].byte_offset, reason));
+        }
+        rb_hash_aset(report,
+                     job->mode == FS_MODE_READ_ENTRIES ? fs_sym("entries") : fs_sym("features"),
+                     rows);
+        rb_hash_aset(report, fs_sym("skipped"), LONG2NUM(job->skipped));
+        rb_hash_aset(report, fs_sym("filtered"), LONG2NUM(job->filtered));
+        rb_hash_aset(report, fs_sym("errors"), errors);
+        RB_GC_GUARD(rows);
+        RB_GC_GUARD(errors);
+        RB_GC_GUARD(report);
+        return report;
+    }
+
+    RB_GC_GUARD(rows);
+    return rows;
+}
+
+typedef struct {
+    fs_safe_job_t *job;
+    tg_index_t *idx;
+} fs_safe_index_finalize_args_t;
+
+static VALUE fs_safe_index_finalize_body(VALUE arg) {
+    fs_safe_index_finalize_args_t *a = (fs_safe_index_finalize_args_t *)arg;
+    fs_safe_job_t *job = a->job;
+    tg_index_t *idx = a->idx;
+
+    if (job->entry_len > 0) {
+        if ((size_t)job->entry_len > SIZE_MAX / sizeof(tg_index_entry_t)) {
+            rb_raise(rb_eNoMemError, "entries allocation size overflow");
+        }
+        idx->entries = calloc((size_t)job->entry_len, sizeof(tg_index_entry_t));
+        if (!idx->entries) {
+            rb_raise(rb_eNoMemError, "entries allocation failed");
+        }
+        idx->entries_bytes = (size_t)job->entry_len * sizeof(tg_index_entry_t);
+        rb_gc_adjust_memory_usage((ssize_t)idx->entries_bytes);
+    }
+
+    for (long i = 0; i < job->entry_len; i++) {
+        tg_index_entry_t entry;
+        memset(&entry, 0, sizeof(entry));
+        entry.id = fs_safe_id_to_value(&job->entries[i].id);
+        entry.geom_owner = Qnil;
+        entry.geom = job->entries[i].geom;
+        entry.bbox = job->entries[i].bbox;
+        entry.geom_bytes = job->entries[i].geom_bytes;
+        entry.ordinal = i;
+        entry.owned = true;
+
+        job->entries[i].geom = NULL; /* ownership moves to idx */
+        idx->entries[i] = entry;
+        idx->initialized++;
+        idx->owned_geom_bytes_total += entry.geom_bytes;
+        if (entry.geom_bytes > 0)
+            rb_gc_adjust_memory_usage((ssize_t)entry.geom_bytes);
+        index_expand_bbox(idx, entry.bbox);
+    }
+
+    if (idx->strategy == TG_GEOMETRY_INDEX_STRATEGY_RTREE) {
+        index_build_rtree(idx);
+    }
+
+    return Qnil;
+}
+
+static VALUE fs_safe_materialize_index(fs_safe_job_t *job) {
+    tg_index_t *idx;
+    VALUE wrapper;
+    fs_safe_index_finalize_args_t args;
+    int state = 0;
+
+    wrapper = TypedData_Make_Struct(cTGGeometryIndex, tg_index_t, &tg_index_type, idx);
+    idx->len = job->entry_len;
+    idx->capacity = job->entry_len;
+    idx->initialized = 0;
+    idx->strategy = job->opts.strategy;
+    idx->predicate = job->opts.predicate;
+    idx->rtree = NULL;
+    idx->frozen = false;
+    idx->has_bbox = false;
+
+    args.job = job;
+    args.idx = idx;
+    rb_protect(fs_safe_index_finalize_body, (VALUE)&args, &state);
+    if (state) {
+        index_dispose(idx);
+        RB_GC_GUARD(wrapper);
+        rb_jump_tag(state);
+    }
+
+    idx->frozen = true;
+    rb_obj_freeze(wrapper);
+    RB_GC_GUARD(wrapper);
+    return wrapper;
+}
+
+static VALUE fs_safe_materialize(VALUE arg) {
+    fs_safe_materialize_args_t *a = (fs_safe_materialize_args_t *)arg;
+    fs_safe_job_t *job = a->job;
+
+    fs_safe_raise_fatal(job);
+    if (job->mode == FS_MODE_BUILD_INDEX)
+        a->result = fs_safe_materialize_index(job);
+    else
+        a->result = fs_safe_materialize_rows(job);
+    return a->result;
+}
+
+static void fs_safe_copy_options(fs_safe_job_t *job, fs_options_t *opts) {
+    long len = RARRAY_LEN(opts->id_path);
+
+    memset(&job->opts, 0, sizeof(job->opts));
+    job->opts.only_all = opts->only_all;
+    job->opts.only_mask = opts->only_mask;
+    job->opts.on_invalid = opts->on_invalid;
+    job->opts.on_missing_id = opts->on_missing_id;
+    job->opts.report = opts->report;
+    job->opts.max_errors = opts->max_errors;
+    job->opts.geometry_index = opts->geometry_index;
+    job->opts.strategy = opts->strategy;
+    job->opts.predicate = opts->predicate;
+    job->opts.len = len;
+
+    if (len > 0) {
+        job->opts.keys = calloc((size_t)len, sizeof(char *));
+        job->opts.lens = calloc((size_t)len, sizeof(size_t));
+        if (!job->opts.keys || !job->opts.lens) {
+            fs_safe_free_c_options(&job->opts);
+            rb_raise(rb_eNoMemError, "FeatureSource id path allocation failed");
+        }
+        for (long i = 0; i < len; i++) {
+            VALUE key = rb_ary_entry(opts->id_path, i);
+            StringValue(key);
+            job->opts.lens[i] = (size_t)RSTRING_LEN(key);
+            job->opts.keys[i] = fs_safe_strdup_len(RSTRING_PTR(key), job->opts.lens[i]);
+            if (!job->opts.keys[i]) {
+                fs_safe_free_c_options(&job->opts);
+                rb_raise(rb_eNoMemError, "FeatureSource id path key allocation failed");
+            }
+        }
+    }
+}
+
+static VALUE fs_safe_dispatch_json(VALUE json_string, VALUE kwargs, fs_mode_t mode) {
+    fs_args_t fs;
+    fs_safe_job_t job;
+    fs_safe_materialize_args_t materialize;
+
+    memset(&fs, 0, sizeof(fs));
+    memset(&job, 0, sizeof(job));
+    memset(&materialize, 0, sizeof(materialize));
+
+    fs.mode = mode;
+    fs.opts = fs_parse_options(kwargs, mode);
+    job.mode = mode;
+    fs_safe_copy_options(&job, &fs.opts);
+    {
+        VALUE str = json_string;
+        StringValue(str);
+        if ((size_t)RSTRING_LEN(str) > SIZE_MAX - 1)
+            rb_raise(rb_eNoMemError, "FeatureSource input is too large");
+        job.source_len = (size_t)RSTRING_LEN(str);
+        job.source_data = ruby_xmalloc(job.source_len + 1);
+        memcpy(job.source_data, RSTRING_PTR(str), job.source_len);
+        job.source_data[job.source_len] = '\0';
+        job.source_ruby_alloc = true;
+        RB_GC_GUARD(str);
+    }
+
+    fs_safe_run_without_gvl(&job);
+    materialize.job = &job;
+    return rb_ensure(fs_safe_materialize, (VALUE)&materialize, fs_safe_job_ensure, (VALUE)&job);
+}
+
+static VALUE fs_safe_dispatch_file(VALUE path, VALUE kwargs, fs_mode_t mode) {
+    fs_args_t fs;
+    fs_safe_job_t job;
+    fs_safe_materialize_args_t materialize;
+    VALUE path_str = path;
+
+    memset(&fs, 0, sizeof(fs));
+    memset(&job, 0, sizeof(job));
+    memset(&materialize, 0, sizeof(materialize));
+
+    StringValueCStr(path_str);
+    fs.mode = mode;
+    fs.opts = fs_parse_options(kwargs, mode);
+    job.mode = mode;
+    fs_safe_copy_options(&job, &fs.opts);
+    job.path = fs_safe_strdup_cstr(StringValueCStr(path_str));
+    if (!job.path) {
+        fs_safe_job_ensure((VALUE)&job);
+        rb_raise(rb_eNoMemError, "FeatureSource path allocation failed");
+    }
+
+    fs_safe_run_without_gvl(&job);
+    materialize.job = &job;
+    return rb_ensure(fs_safe_materialize, (VALUE)&materialize, fs_safe_job_ensure, (VALUE)&job);
+}
+
+static VALUE fs_read_body(VALUE arg) {
+    fs_args_t *fs = (fs_args_t *)arg;
+    struct json features;
+    struct json feature;
+    VALUE rows;
+    VALUE errors;
+    long feature_index = 0;
+    long skipped = 0;
+    long filtered = 0;
+
+    fs_parse_root(&fs->source, &features);
+    rows = rb_ary_new();
+    errors = rb_ary_new();
+
+    for (feature = json_first(features); json_exists(feature);
+         feature = json_next(feature), feature_index++) {
+        fs_feature_result_t prepared;
+        VALUE tg_error = Qnil;
+
+        if (!fs_feature_prepare(&fs->source, &fs->opts, fs->mode, feature, feature_index, true,
+                                &prepared)) {
+            fs_handle_invalid_or_raise(&fs->source, &fs->opts, &prepared, feature_index, errors,
+                                       &skipped);
+            continue;
+        }
+
+        if (prepared.filtered) {
+            filtered++;
+            continue;
+        }
+
+        if (!fs_validate_geometry_or_error(prepared.geometry, fs->opts.geometry_index, &tg_error)) {
+            prepared.reason_value = rb_str_plus(rb_str_new_cstr("invalid geometry: "), tg_error);
+            fs_handle_invalid_or_raise(&fs->source, &fs->opts, &prepared, feature_index, errors,
+                                       &skipped);
+            continue;
+        }
+
+        if (fs->mode == FS_MODE_READ_ENTRIES) {
+            VALUE geom_json =
+                fs_utf8_string(json_raw(prepared.geometry), json_raw_length(prepared.geometry));
+            rb_ary_push(rows, rb_ary_new_from_args(2, prepared.id, geom_json));
+        } else {
+            VALUE geom_json =
+                fs_utf8_string(json_raw(prepared.geometry), json_raw_length(prepared.geometry));
+            VALUE props_json = fs_properties_json_string(prepared.properties);
+            rb_ary_push(rows, rb_ary_new_from_args(3, prepared.id, geom_json, props_json));
+        }
+    }
+
+    if (fs->opts.report) {
+        VALUE report = rb_hash_new();
+        rb_hash_aset(report,
+                     fs->mode == FS_MODE_READ_ENTRIES ? fs_sym("entries") : fs_sym("features"),
+                     rows);
+        rb_hash_aset(report, fs_sym("skipped"), LONG2NUM(skipped));
+        rb_hash_aset(report, fs_sym("filtered"), LONG2NUM(filtered));
+        rb_hash_aset(report, fs_sym("errors"), errors);
+        RB_GC_GUARD(rows);
+        RB_GC_GUARD(errors);
+        RB_GC_GUARD(report);
+        RB_GC_GUARD(fs->opts.id_path);
+        return report;
+    }
+
+    RB_GC_GUARD(errors);
+    RB_GC_GUARD(rows);
+    RB_GC_GUARD(fs->opts.id_path);
+    return rows;
+}
+
+static long fs_count_accepted_features(fs_args_t *fs, struct json features) {
+    struct json feature;
+    long feature_index = 0;
+    long accepted = 0;
+
+    for (feature = json_first(features); json_exists(feature);
+         feature = json_next(feature), feature_index++) {
+        fs_feature_result_t prepared;
+        long skipped = 0;
+
+        if (!fs_feature_prepare(&fs->source, &fs->opts, FS_MODE_BUILD_INDEX, feature, feature_index,
+                                false, &prepared)) {
+            fs_handle_invalid_or_raise(&fs->source, &fs->opts, &prepared, feature_index, Qnil,
+                                       &skipped);
+        }
+
+        if (prepared.filtered)
+            continue;
+        if (prepared.accepted)
+            accepted++;
+    }
+
+    return accepted;
+}
+
+static void fs_fill_index_entry_from_geometry(tg_index_t *idx, long ordinal, VALUE id,
+                                              struct json geometry, enum tg_index geometry_index,
+                                              fs_source_t *source, long feature_index) {
+    tg_index_entry_t entry;
+    struct tg_geom *geom;
+    const char *err;
+
+    geom = tg_parse_geojsonn_ix(json_raw(geometry), json_raw_length(geometry), geometry_index);
+    if (!geom) {
+        rb_raise(rb_eNoMemError, "TG geometry allocation failed");
+    }
+
+    err = tg_geom_error(geom);
+    if (err) {
+        VALUE msg = rb_str_new_cstr(err);
+        VALUE full;
+        tg_geom_free(geom);
+        full = rb_str_plus(rb_str_new_cstr("invalid geometry: "), msg);
+        fs_raise_parse_error_value(feature_index, fs_json_offset(source, geometry), full);
+    }
+
+    memset(&entry, 0, sizeof(entry));
+    entry.id = id;
+    entry.geom_owner = Qnil;
+    entry.geom = geom;
+    entry.bbox = tg_geom_rect(geom);
+    entry.geom_bytes = tg_geom_memsize(geom);
+    entry.ordinal = ordinal;
+    entry.owned = true;
+
+    idx->entries[ordinal] = entry;
+    idx->initialized++;
+    idx->owned_geom_bytes_total += entry.geom_bytes;
+    if (entry.geom_bytes > 0) {
+        rb_gc_adjust_memory_usage((ssize_t)entry.geom_bytes);
+    }
+    index_expand_bbox(idx, entry.bbox);
+}
+
+static VALUE fs_build_index_body(VALUE arg) {
+    fs_build_args_t *build = (fs_build_args_t *)arg;
+    fs_args_t *fs = build->fs;
+    tg_index_t *idx = build->idx;
+    struct json feature;
+    long feature_index = 0;
+    long ordinal = 0;
+
+    for (feature = json_first(build->features); json_exists(feature);
+         feature = json_next(feature), feature_index++) {
+        fs_feature_result_t prepared;
+        long skipped = 0;
+
+        if (!fs_feature_prepare(&fs->source, &fs->opts, FS_MODE_BUILD_INDEX, feature, feature_index,
+                                true, &prepared)) {
+            fs_handle_invalid_or_raise(&fs->source, &fs->opts, &prepared, feature_index, Qnil,
+                                       &skipped);
+        }
+
+        if (prepared.filtered)
+            continue;
+        if (!prepared.accepted)
+            continue;
+
+        fs_fill_index_entry_from_geometry(idx, ordinal, prepared.id, prepared.geometry,
+                                          fs->opts.geometry_index, &fs->source, feature_index);
+        ordinal++;
+    }
+
+    if (idx->initialized != idx->len) {
+        rb_raise(eTGGeometryError, "internal FeatureSource index initialization mismatch");
+    }
+
+    if (idx->strategy == TG_GEOMETRY_INDEX_STRATEGY_RTREE) {
+        index_build_rtree(idx);
+    }
+
+    return Qnil;
+}
+
+static VALUE fs_build_index(VALUE arg) {
+    fs_args_t *fs = (fs_args_t *)arg;
+    struct json features;
+    long accepted;
+    tg_index_t *idx;
+    VALUE wrapper;
+    fs_build_args_t build;
+    int state = 0;
+
+    fs_parse_root(&fs->source, &features);
+    accepted = fs_count_accepted_features(fs, features);
+
+    wrapper = TypedData_Make_Struct(cTGGeometryIndex, tg_index_t, &tg_index_type, idx);
+    idx->len = accepted;
+    idx->capacity = accepted;
+    idx->initialized = 0;
+    idx->strategy = fs->opts.strategy;
+    idx->predicate = fs->opts.predicate;
+    idx->rtree = NULL;
+    idx->frozen = false;
+    idx->has_bbox = false;
+
+    if (accepted > 0) {
+        if ((size_t)accepted > SIZE_MAX / sizeof(tg_index_entry_t)) {
+            rb_raise(rb_eNoMemError, "entries allocation size overflow");
+        }
+        idx->entries = calloc((size_t)accepted, sizeof(tg_index_entry_t));
+        if (!idx->entries) {
+            rb_raise(rb_eNoMemError, "entries allocation failed");
+        }
+        idx->entries_bytes = (size_t)accepted * sizeof(tg_index_entry_t);
+        rb_gc_adjust_memory_usage((ssize_t)idx->entries_bytes);
+    }
+
+    build.fs = fs;
+    build.features = features;
+    build.wrapper = wrapper;
+    build.idx = idx;
+
+    rb_protect(fs_build_index_body, (VALUE)&build, &state);
+    if (state) {
+        index_dispose(idx);
+        RB_GC_GUARD(wrapper);
+        RB_GC_GUARD(fs->opts.id_path);
+        rb_jump_tag(state);
+    }
+
+    idx->frozen = true;
+    rb_obj_freeze(wrapper);
+
+    RB_GC_GUARD(wrapper);
+    RB_GC_GUARD(fs->opts.id_path);
+    return wrapper;
+}
+
+static VALUE fs_source_ensure(VALUE arg) {
+    fs_args_t *fs = (fs_args_t *)arg;
+
+    if (fs->source.data) {
+        ruby_xfree(fs->source.data);
+        fs->source.data = NULL;
+        fs->source.len = 0;
+    }
+
+    return Qnil;
+}
+
+static void fs_copy_source_from_string(fs_args_t *fs, VALUE source) {
+    VALUE str = source;
+    StringValue(str);
+
+    if ((size_t)RSTRING_LEN(str) > SIZE_MAX - 1) {
+        rb_raise(rb_eNoMemError, "FeatureSource input is too large");
+    }
+
+    fs->source.len = (size_t)RSTRING_LEN(str);
+    fs->source.data = ruby_xmalloc(fs->source.len + 1);
+    memcpy(fs->source.data, RSTRING_PTR(str), fs->source.len);
+    fs->source.data[fs->source.len] = '\0';
+    RB_GC_GUARD(str);
+}
+
+static VALUE __attribute__((unused)) fs_dispatch(VALUE source_string, VALUE kwargs,
+                                                 fs_mode_t mode) {
+    fs_args_t fs;
+
+    memset(&fs, 0, sizeof(fs));
+    fs.mode = mode;
+    fs.opts = fs_parse_options(kwargs, mode);
+    fs_copy_source_from_string(&fs, source_string);
+
+    if (mode == FS_MODE_BUILD_INDEX) {
+        return rb_ensure(fs_build_index, (VALUE)&fs, fs_source_ensure, (VALUE)&fs);
+    }
+
+    return rb_ensure(fs_read_body, (VALUE)&fs, fs_source_ensure, (VALUE)&fs);
+}
+
+static VALUE __attribute__((unused)) fs_read_file_to_string(VALUE path) {
+    return rb_funcall(rb_cFile, rb_intern("binread"), 1, path);
+}
+
+static VALUE fs_read_io_to_string(VALUE io) {
+    VALUE str;
+
+    if (!rb_respond_to(io, id_read)) {
+        rb_raise(rb_eTypeError, "io must respond to read");
+    }
+    str = rb_funcall(io, id_read, 0);
+    if (!RB_TYPE_P(str, T_STRING)) {
+        rb_raise(rb_eTypeError, "io.read must return String");
+    }
+    return str;
+}
+
+static VALUE rb_tg_feature_source_read_entries_json(int argc, VALUE *argv, VALUE self) {
+    VALUE json_string;
+    VALUE kwargs;
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &json_string, &kwargs);
+    return fs_safe_dispatch_json(json_string, kwargs, FS_MODE_READ_ENTRIES);
+}
+
+static VALUE rb_tg_feature_source_read_features_json(int argc, VALUE *argv, VALUE self) {
+    VALUE json_string;
+    VALUE kwargs;
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &json_string, &kwargs);
+    return fs_safe_dispatch_json(json_string, kwargs, FS_MODE_READ_FEATURES);
+}
+
+static VALUE rb_tg_feature_source_build_index_json(int argc, VALUE *argv, VALUE self) {
+    VALUE json_string;
+    VALUE kwargs;
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &json_string, &kwargs);
+    return fs_safe_dispatch_json(json_string, kwargs, FS_MODE_BUILD_INDEX);
+}
+
+static VALUE rb_tg_feature_source_read_entries_file(int argc, VALUE *argv, VALUE self) {
+    VALUE path;
+    VALUE kwargs;
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &path, &kwargs);
+    return fs_safe_dispatch_file(path, kwargs, FS_MODE_READ_ENTRIES);
+}
+
+static VALUE rb_tg_feature_source_read_features_file(int argc, VALUE *argv, VALUE self) {
+    VALUE path;
+    VALUE kwargs;
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &path, &kwargs);
+    return fs_safe_dispatch_file(path, kwargs, FS_MODE_READ_FEATURES);
+}
+
+static VALUE rb_tg_feature_source_build_index_file(int argc, VALUE *argv, VALUE self) {
+    VALUE path;
+    VALUE kwargs;
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &path, &kwargs);
+    return fs_safe_dispatch_file(path, kwargs, FS_MODE_BUILD_INDEX);
+}
+
+static VALUE rb_tg_feature_source_read_entries_io(int argc, VALUE *argv, VALUE self) {
+    VALUE io;
+    VALUE kwargs;
+    VALUE json_string;
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &io, &kwargs);
+    json_string = fs_read_io_to_string(io);
+    return fs_safe_dispatch_json(json_string, kwargs, FS_MODE_READ_ENTRIES);
+}
+
+static VALUE rb_tg_feature_source_read_features_io(int argc, VALUE *argv, VALUE self) {
+    VALUE io;
+    VALUE kwargs;
+    VALUE json_string;
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &io, &kwargs);
+    json_string = fs_read_io_to_string(io);
+    return fs_safe_dispatch_json(json_string, kwargs, FS_MODE_READ_FEATURES);
+}
+
+static VALUE rb_tg_feature_source_build_index_io(int argc, VALUE *argv, VALUE self) {
+    VALUE io;
+    VALUE kwargs;
+    VALUE json_string;
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &io, &kwargs);
+    json_string = fs_read_io_to_string(io);
+    return fs_safe_dispatch_json(json_string, kwargs, FS_MODE_BUILD_INDEX);
+}
+
 RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     tg_geometry_vendor_header_sanity();
 
@@ -2878,6 +5268,24 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     id_rtree = rb_intern("rtree");
     id_covers = rb_intern("covers");
     id_contains = rb_intern("contains");
+    id_id = rb_intern("id");
+    id_only = rb_intern("only");
+    id_on_invalid = rb_intern("on_invalid");
+    id_on_missing_id = rb_intern("on_missing_id");
+    id_report = rb_intern("report");
+    id_max_errors = rb_intern("max_errors");
+    id_read = rb_intern("read");
+    id_join = rb_intern("join");
+    id_raise = rb_intern("raise");
+    id_skip = rb_intern("skip");
+    id_ordinal = rb_intern("ordinal");
+    id_polygon = rb_intern("polygon");
+    id_multipolygon = rb_intern("multipolygon");
+    id_point = rb_intern("point");
+    id_linestring = rb_intern("linestring");
+    id_multipoint = rb_intern("multipoint");
+    id_multilinestring = rb_intern("multilinestring");
+    id_geometrycollection = rb_intern("geometrycollection");
 
     mTG = rb_define_module("TG");
     mTGGeometry = rb_define_module_under(mTG, "Geometry");
@@ -3014,6 +5422,26 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
                      1);
     rb_define_method(cTGGeometryRect, "expand_to_include_point",
                      rb_tg_geometry_rect_expand_to_include_point, 2);
+
+    mTGGeometryFeatureSource = rb_define_module_under(mTGGeometry, "FeatureSource");
+    rb_define_singleton_method(mTGGeometryFeatureSource, "read_entries_file",
+                               rb_tg_feature_source_read_entries_file, -1);
+    rb_define_singleton_method(mTGGeometryFeatureSource, "read_entries_json",
+                               rb_tg_feature_source_read_entries_json, -1);
+    rb_define_singleton_method(mTGGeometryFeatureSource, "read_entries_io",
+                               rb_tg_feature_source_read_entries_io, -1);
+    rb_define_singleton_method(mTGGeometryFeatureSource, "read_features_file",
+                               rb_tg_feature_source_read_features_file, -1);
+    rb_define_singleton_method(mTGGeometryFeatureSource, "read_features_json",
+                               rb_tg_feature_source_read_features_json, -1);
+    rb_define_singleton_method(mTGGeometryFeatureSource, "read_features_io",
+                               rb_tg_feature_source_read_features_io, -1);
+    rb_define_singleton_method(mTGGeometryFeatureSource, "build_index_file",
+                               rb_tg_feature_source_build_index_file, -1);
+    rb_define_singleton_method(mTGGeometryFeatureSource, "build_index_json",
+                               rb_tg_feature_source_build_index_json, -1);
+    rb_define_singleton_method(mTGGeometryFeatureSource, "build_index_io",
+                               rb_tg_feature_source_build_index_io, -1);
 
     cTGGeometryIndex = rb_define_class_under(mTGGeometry, "Index", rb_cObject);
     rb_undef_alloc_func(cTGGeometryIndex);

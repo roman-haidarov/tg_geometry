@@ -26,6 +26,14 @@ PINS = {
     sha256: "4afc86cbd3abe03730206031a5aff5b8b29d37b055fc356052f6f06e1d1f9a61",
     target: "rtree",
     files: %w[rtree.c rtree.h LICENSE README.md]
+  },
+  json: {
+    repo: "https://github.com/tidwall/json.c.git",
+    ref: "main",
+    commit: "4aaf99b5c08e4e1364f97500fe5c5d5a2617b4a6",
+    sha256: "059393302de9325ab6ccf79c298234f2b688a59d138103305da317d2d0176fe2",
+    target: "json",
+    files: %w[json.c json.h LICENSE]
   }
 }.freeze
 
@@ -160,9 +168,13 @@ def write_manifest(results)
   File.utime(NORMALIZED_MTIME, NORMALIZED_MTIME, MANIFEST_PATH)
 end
 
-def expected_vendor_results
+def expected_vendor_results(manifest = nil)
+  manifest ||= parse_kv_file(MANIFEST_PATH)
+
   PINS.each_with_object({}) do |(name, pin), results|
-    results[name] = pin.merge(tree_sha256: pin.fetch(:sha256))
+    manifest_sha = manifest["#{name}_tree_sha256"]
+    tree_sha = pin.fetch(:sha256) || manifest_sha
+    results[name] = pin.merge(tree_sha256: tree_sha)
   end
 end
 
@@ -186,6 +198,7 @@ end
 
 def verify_vendor_tree
   failures = []
+  manifest = parse_kv_file(MANIFEST_PATH)
 
   PINS.each do |name, pin|
     target = File.join(VENDOR_DIR, pin.fetch(:target))
@@ -207,12 +220,15 @@ def verify_vendor_tree
     next unless failures.none? { |failure| failure.start_with?("#{name}:") }
 
     actual_sha256 = tree_sha256_for(target)
-    expected_sha256 = pin.fetch(:sha256)
-    failures << "#{name}: tree_sha256 mismatch: expected #{expected_sha256}, got #{actual_sha256}" unless actual_sha256 == expected_sha256
+    expected_sha256 = pin.fetch(:sha256) || manifest["#{name}_tree_sha256"]
+    if expected_sha256.nil? || expected_sha256.empty?
+      failures << "#{name}: tree_sha256 missing from manifest"
+    elsif actual_sha256 != expected_sha256
+      failures << "#{name}: tree_sha256 mismatch: expected #{expected_sha256}, got #{actual_sha256}"
+    end
   end
 
-  expected_results = expected_vendor_results
-  manifest = parse_kv_file(MANIFEST_PATH)
+  expected_results = expected_vendor_results(manifest)
   if manifest.empty?
     failures << "manifest: missing #{MANIFEST_PATH}"
   else

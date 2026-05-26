@@ -12,6 +12,7 @@ end
 VENDOR_DIR = File.expand_path("vendor", __dir__)
 VENDORED_TG_DIR = File.join(VENDOR_DIR, "tg")
 VENDORED_RTREE_DIR = File.join(VENDOR_DIR, "rtree")
+VENDORED_JSON_DIR = File.join(VENDOR_DIR, "json")
 
 required_vendor_files = [
   File.join(VENDORED_TG_DIR, "tg.c"),
@@ -19,7 +20,11 @@ required_vendor_files = [
   File.join(VENDORED_TG_DIR, "VERSION"),
   File.join(VENDORED_RTREE_DIR, "rtree.c"),
   File.join(VENDORED_RTREE_DIR, "rtree.h"),
-  File.join(VENDORED_RTREE_DIR, "VERSION")
+  File.join(VENDORED_RTREE_DIR, "VERSION"),
+  File.join(VENDORED_JSON_DIR, "json.c"),
+  File.join(VENDORED_JSON_DIR, "json.h"),
+  File.join(VENDORED_JSON_DIR, "LICENSE"),
+  File.join(VENDORED_JSON_DIR, "VERSION")
 ]
 
 missing_vendor_files = required_vendor_files.reject { |path| File.file?(path) }
@@ -27,10 +32,44 @@ unless missing_vendor_files.empty?
   abort "tg_geometry requires vendored tidwall/tg and rtree.c sources. Missing: #{missing_vendor_files.join(", ")}. Run `ruby script/vendor_libs.rb --sync`."
 end
 
+def tg_geometry_clang_compiler?
+  cc = RbConfig::CONFIG["CC"].to_s
+  return true if cc.include?("clang")
+
+  # Some build environments use cc as an alias. Detect __clang__ by compiling
+  # a tiny program rather than trusting the command name.
+  try_compile(<<~C)
+    #ifndef __clang__
+    #error not clang
+    #endif
+    int main(void) { return 0; }
+  C
+end
+
+def tg_geometry_sanitize_warnflags!
+  return if tg_geometry_clang_compiler?
+
+  # Ruby builds produced with clang may leak clang-only warning flags into
+  # RbConfig::CONFIG["warnflags"]. GCC prints noisy "unrecognized command-line
+  # option" notes once any real diagnostic is emitted. Keep our Linux CI logs
+  # focused on tg_geometry diagnostics.
+  clang_only_warning_flags = %w[
+    -Wno-constant-logical-operand
+    -Wno-parentheses-equality
+    -Wno-self-assign
+  ]
+
+  $warnflags = $warnflags.to_s.split.reject do |flag|
+    clang_only_warning_flags.include?(flag)
+  end.join(" ")
+end
+
+tg_geometry_sanitize_warnflags!
+
 forbidden_defines = %w[TG_NOATOMICS RTREE_NOATOMICS]
 forbidden_defines.each do |macro|
   if ($CFLAGS.to_s.split + $CPPFLAGS.to_s.split + $defs).any? { |flag| flag.include?(macro) }
-    abort "tg_geometry must not define #{macro}; atomics are required by the release-core contract"
+    abort "tg_geometry must not define #{macro}; atomics are required by the build requirements"
   end
 end
 
@@ -52,7 +91,8 @@ $INCFLAGS = [
   "-isystem $(hdrdir)/ruby/backward",
   "-isystem $(hdrdir)",
   "-I$(srcdir)/vendor/tg",
-  "-I$(srcdir)/vendor/rtree"
+  "-I$(srcdir)/vendor/rtree",
+  "-I$(srcdir)/vendor/json"
 ].join(" ")
 
 unless try_compile(<<~C)
@@ -78,6 +118,10 @@ if have_macro("RB_NOGVL_OFFLOAD_SAFE", "ruby/thread.h")
   $defs << "-DHAVE_RB_NOGVL_OFFLOAD_SAFE"
 end
 
+if have_func("rb_fiber_scheduler_current", "ruby/fiber/scheduler.h")
+  $defs << "-DHAVE_RB_FIBER_SCHEDULER_CURRENT"
+end
+
 if ENV["TG_DEBUG_TEST"] == "1"
   $defs << "-DTG_DEBUG_TEST"
 end
@@ -85,7 +129,8 @@ end
 $srcs = [
   "tg_geometry_ext.c",
   "tg_geometry_vendor_tg.c",
-  "tg_geometry_vendor_rtree.c"
+  "tg_geometry_vendor_rtree.c",
+  "tg_geometry_vendor_json.c"
 ]
 
 create_makefile("tg_geometry_ext_geometry_ext")

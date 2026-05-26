@@ -2,23 +2,13 @@
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wshorten-64-to-32"
 #pragma clang diagnostic ignored "-Wincompatible-pointer-types-discards-qualifiers"
-#pragma clang diagnostic ignored "-Wformat-nonliteral"
 #elif defined(__GNUC__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wconversion"
 #pragma GCC diagnostic ignored "-Wdiscarded-qualifiers"
-#pragma GCC diagnostic ignored "-Wsuggest-attribute=format"
 #endif
 
-#ifndef asm
-#define asm __asm__
-#endif
-
-#ifndef M_PI
-#define M_PI 3.14159265358979323846264338327950288
-#endif
-
-#include "vendor/tg/tg.c"
+#include "vendor/json/json.c"
 
 #if defined(__clang__)
 #pragma clang diagnostic pop

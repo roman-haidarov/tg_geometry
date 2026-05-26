@@ -70,6 +70,25 @@ The first release does not expose `strategy: :auto`. Choosing a threshold requir
 
 The first release does not claim Falcon or Async behavior. A dedicated Falcon/Async benchmark remains an open setup item until the dependency and scenario are approved.
 
-## Expansion Block A: auto strategy threshold
+## Planned API areas: auto strategy threshold
 
 `strategy: :auto` remains postponed for the first public release. A future implementation must use a complete project-owned benchmark matrix and document the selected threshold before exposing the public option.
+
+## FeatureSource benchmark
+
+`benchmark/feature_source.rb` compares:
+
+- `JSON.parse + Ruby extraction` baseline;
+- `FeatureSource.read_entries_file`;
+- `FeatureSource.read_features_file`;
+- direct `FeatureSource.build_index_file`;
+- `Index.build(read_entries, via: :geojson)`.
+
+Run:
+
+```bash
+bundle exec ruby benchmark/feature_source.rb
+TGEOMETRY_BENCH_FULL=1 bundle exec ruby benchmark/feature_source.rb
+```
+
+Do not publish FeatureSource performance claims unless they come from this benchmark on the target dataset and environment.

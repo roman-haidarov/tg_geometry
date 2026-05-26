@@ -1,0 +1,15 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"@id": "zone/a", "name": "A"},
+      "geometry": {"type": "Polygon", "coordinates": [[[0,0],[0,10],[10,10],[10,0],[0,0]]]}
+    },
+    {
+      "type": "Feature",
+      "properties": {"@id": 2},
+      "geometry": {"type": "MultiPolygon", "coordinates": [[[[20,20],[20,30],[30,30],[30,20],[20,20]]]]}
+    }
+  ]
+}

@@ -136,5 +136,4 @@ See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for the full list.
 - [docs/CONCURRENCY.md](docs/CONCURRENCY.md) — threading rules
 - [docs/ERROR_HANDLING.md](docs/ERROR_HANDLING.md) — exception hierarchy
 - [docs/BENCHMARKING.md](docs/BENCHMARKING.md) — running the benchmark scripts
-- [docs/REGISTRY.md](docs/REGISTRY.md) — `TG::Geometry::Registry` reload sugar
-- [docs/ACTIVE_RECORD.md](docs/ACTIVE_RECORD.md) — optional ActiveRecord source
+- [docs/FEATURE_SOURCE.md](docs/FEATURE_SOURCE.md) — GeoJSON FeatureCollection imports
