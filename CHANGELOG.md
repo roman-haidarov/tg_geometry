@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.3.0 - 27.05.2026
+
+### Added
+
+- `TG::Geometry.line_string`, `TG::Geometry.polygon`, and `TG::Geometry.multi_polygon` constructors from Ruby arrays.
+- `TG::Geometry::Geom#srid` with automatic EWKB SRID extraction in `parse_wkb` and `parse_hex`.
+- `TG::Geometry::Geom#to_ewkb` writer with explicit `srid:` override.
+- `TG::Geometry::Index#intersecting_geom_ids`, `#covering_geom_ids`, and `#containing_geom_ids`.
+- `TG::Geometry::Line#nearest_segment` and `TG::Geometry::Ring#nearest_segment` with `TG::Geometry::NearestSegment` result objects.
+- `TG::Geometry::ActiveRecordType` read-only optional require.
+- PostGIS/EWKB fixture suite in `spec/fixtures/postgis/`.
+
+### Fixed
+
+- Reject unsupported/unknown keywords on v0.3.0 APIs instead of silently ignoring them, including non-goals such as `release_gvl:`, `parse_wkb(srid:)`, and `parse_wkb(ewkb:)`.
+- Harden constructor cleanup paths so intermediate C `tg_ring` / `tg_poly` objects are released when Ruby exceptions occur during nested polygon construction.
+- Keep geometry-index query collection in a C-only status-returning phase before Ruby result materialization, preserving the intended no-GVL-safe internal shape.
+
+### Clarified
+
+- `Index.build(predicate:)` affects only legacy point query methods: `find_covering`, `covering_ids(x, y)`, and `covering_ids_batch_packed`.
+
+### Not included
+
+- Geodesic / Haversine distance.
+- Projection / reprojection.
+- Buffer / union / difference / convex hull.
+- Index nearest_ids (KNN).
+- GeoBIN bbox helpers.
+- Streaming FeatureSource.
+- Index serialization / mmap.
+- Ractor support.
+- Windows / JRuby.
+- Write-side ActiveRecordType / AR scopes / migrations.
+- Z/M variants of constructors.
+- Public `release_gvl:` option.
+
 ## 0.1.0 - unreleased
 
 Initial public release candidate for `tg_geometry`.

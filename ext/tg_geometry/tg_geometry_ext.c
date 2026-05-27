@@ -49,6 +49,7 @@ static VALUE cTGGeometryLine;
 static VALUE cTGGeometryRing;
 static VALUE cTGGeometryPolygon;
 static VALUE cTGGeometrySegment;
+static VALUE cTGGeometryNearestSegment;
 static VALUE eTGGeometryError;
 static VALUE eTGGeometryParseError;
 static VALUE eTGGeometryArgumentError;
@@ -59,6 +60,8 @@ typedef struct {
     struct tg_geom *geom;
     size_t geom_bytes;
     bool owned;
+    bool has_srid;
+    int srid;
 } tg_geom_wrapper_t;
 
 typedef struct {
@@ -89,6 +92,14 @@ typedef struct {
     bool initialized;
 } tg_segment_wrapper_t;
 
+typedef struct {
+    struct tg_segment segment;
+    long index;
+    double distance;
+    struct tg_point point;
+    bool initialized;
+} tg_nearest_segment_wrapper_t;
+
 enum tg_geometry_index_via {
     TG_GEOMETRY_INDEX_VIA_GEOM,
     TG_GEOMETRY_INDEX_VIA_GEOJSON,
@@ -103,6 +114,12 @@ enum tg_geometry_index_strategy {
 enum tg_geometry_index_predicate {
     TG_GEOMETRY_INDEX_PREDICATE_COVERS,
     TG_GEOMETRY_INDEX_PREDICATE_CONTAINS,
+};
+
+enum tg_geometry_geom_query_predicate {
+    TG_GEOMETRY_GEOM_QUERY_INTERSECTS,
+    TG_GEOMETRY_GEOM_QUERY_COVERS,
+    TG_GEOMETRY_GEOM_QUERY_CONTAINS,
 };
 
 typedef struct {
@@ -143,6 +160,7 @@ static _Thread_local tg_index_t *tg_current_rtree_owner = NULL;
 
 static ID id_format;
 static ID id_index;
+static ID id_srid;
 static ID id_auto;
 static ID id_geojson;
 static ID id_wkt;
@@ -179,6 +197,8 @@ static ID id_linestring;
 static ID id_multipoint;
 static ID id_multilinestring;
 static ID id_geometrycollection;
+static ID id_exterior;
+static ID id_holes;
 
 #ifdef TG_DEBUG_TEST
 static bool tg_debug_fail_next_entries_alloc = false;
@@ -227,6 +247,8 @@ static void geom_free(void *ptr) {
     w->geom_owner = Qnil;
     w->geom_bytes = 0;
     w->owned = false;
+    w->has_srid = false;
+    w->srid = 0;
 
     ruby_xfree(w);
 }
@@ -410,6 +432,29 @@ static const rb_data_type_t tg_segment_type = {
     RUBY_TYPED_FREE_IMMEDIATELY,
 };
 
+static void nearest_segment_free(void *ptr) {
+    ruby_xfree(ptr);
+}
+
+static size_t nearest_segment_memsize(const void *ptr) {
+    (void)ptr;
+    return sizeof(tg_nearest_segment_wrapper_t);
+}
+
+static const rb_data_type_t tg_nearest_segment_type = {
+    "TG::Geometry::NearestSegment",
+    {
+        NULL,
+        nearest_segment_free,
+        nearest_segment_memsize,
+        NULL,
+        {0},
+    },
+    0,
+    0,
+    RUBY_TYPED_FREE_IMMEDIATELY,
+};
+
 static void index_dispose(tg_index_t *idx) {
     if (!idx)
         return;
@@ -521,6 +566,62 @@ static const rb_data_type_t tg_index_type = {
     RUBY_TYPED_FREE_IMMEDIATELY,
 };
 
+typedef struct {
+    const ID *allowed;
+    size_t count;
+} tg_keyword_validation_args_t;
+
+static bool kwargs_has_key(VALUE kwargs, ID key) {
+    if (NIL_P(kwargs)) {
+        return false;
+    }
+
+    return RTEST(rb_funcall(kwargs, rb_intern("key?"), 1, ID2SYM(key)));
+}
+
+static bool keyword_allowed_p(ID key, const ID *allowed, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        if (key == allowed[i]) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static int validate_keyword_i(VALUE key, VALUE value, VALUE arg) {
+    tg_keyword_validation_args_t *args = (tg_keyword_validation_args_t *)arg;
+
+    (void)value;
+
+    if (!SYMBOL_P(key)) {
+        rb_raise(eTGGeometryArgumentError, "keyword must be a Symbol");
+    }
+
+    if (!keyword_allowed_p(SYM2ID(key), args->allowed, args->count)) {
+        const char *name = rb_id2name(SYM2ID(key));
+        rb_raise(eTGGeometryArgumentError, "unknown keyword: :%s", name ? name : "?");
+    }
+
+    return ST_CONTINUE;
+}
+
+static void validate_keywords(VALUE kwargs, const ID *allowed, size_t count) {
+    tg_keyword_validation_args_t args;
+
+    if (NIL_P(kwargs)) {
+        return;
+    }
+
+    if (!RB_TYPE_P(kwargs, T_HASH)) {
+        rb_raise(eTGGeometryArgumentError, "keywords must be a Hash");
+    }
+
+    args.allowed = allowed;
+    args.count = count;
+    rb_hash_foreach(kwargs, validate_keyword_i, (VALUE)&args);
+}
+
 static VALUE kwargs_value(VALUE kwargs, ID key, VALUE fallback) {
     VALUE value;
 
@@ -588,6 +689,120 @@ static enum tg_geometry_parse_format parse_format_symbol(VALUE value) {
              "format: must be one of :auto, :geojson, :wkt, :wkb, :hex, :geobin");
 }
 
+static uint32_t tg_geometry_read_u32(const uint8_t *bytes, uint8_t byte_order) {
+    if (byte_order == 0) {
+        return ((uint32_t)bytes[0] << 24) | ((uint32_t)bytes[1] << 16) | ((uint32_t)bytes[2] << 8) |
+               (uint32_t)bytes[3];
+    }
+
+    return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8) | ((uint32_t)bytes[2] << 16) |
+           ((uint32_t)bytes[3] << 24);
+}
+
+static void tg_geometry_write_u32(uint8_t *bytes, uint32_t value, uint8_t byte_order) {
+    if (byte_order == 0) {
+        bytes[0] = (uint8_t)((value >> 24) & 0xff);
+        bytes[1] = (uint8_t)((value >> 16) & 0xff);
+        bytes[2] = (uint8_t)((value >> 8) & 0xff);
+        bytes[3] = (uint8_t)(value & 0xff);
+        return;
+    }
+
+    bytes[0] = (uint8_t)(value & 0xff);
+    bytes[1] = (uint8_t)((value >> 8) & 0xff);
+    bytes[2] = (uint8_t)((value >> 16) & 0xff);
+    bytes[3] = (uint8_t)((value >> 24) & 0xff);
+}
+
+static bool extract_ewkb_srid(const uint8_t *bytes, size_t len, bool *has_srid_out, int *srid_out) {
+    uint8_t byte_order;
+    uint32_t type;
+    uint32_t srid;
+
+    *has_srid_out = false;
+    *srid_out = 0;
+
+    if (len < 5) {
+        return false;
+    }
+
+    byte_order = bytes[0];
+    if (byte_order > 1) {
+        return false;
+    }
+
+    type = tg_geometry_read_u32(bytes + 1, byte_order);
+    if ((type & 0x20000000u) == 0) {
+        return true;
+    }
+
+    if (len < 9) {
+        return false;
+    }
+
+    srid = tg_geometry_read_u32(bytes + 5, byte_order);
+    if (srid > (uint32_t)INT_MAX) {
+        rb_raise(eTGGeometryParseError, "EWKB SRID is out of supported range");
+    }
+
+    *has_srid_out = true;
+    *srid_out = (int)srid;
+    return true;
+}
+
+static int tg_geometry_hex_digit(unsigned char ch) {
+    if (ch >= '0' && ch <= '9')
+        return (int)(ch - '0');
+    if (ch >= 'a' && ch <= 'f')
+        return (int)(ch - 'a' + 10);
+    if (ch >= 'A' && ch <= 'F')
+        return (int)(ch - 'A' + 10);
+    return -1;
+}
+
+static bool extract_hex_ewkb_srid(const char *hex, size_t len, bool *has_srid_out, int *srid_out) {
+    uint8_t header[9];
+    size_t bytes_to_decode;
+
+    *has_srid_out = false;
+    *srid_out = 0;
+
+    if (len < 10) {
+        return false;
+    }
+
+    bytes_to_decode = len >= 18 ? 9 : 5;
+    for (size_t i = 0; i < bytes_to_decode; i++) {
+        int hi = tg_geometry_hex_digit((unsigned char)hex[i * 2]);
+        int lo = tg_geometry_hex_digit((unsigned char)hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        header[i] = (uint8_t)((hi << 4) | lo);
+    }
+
+    return extract_ewkb_srid(header, bytes_to_decode, has_srid_out, srid_out);
+}
+
+static bool parse_srid_option(VALUE srid_value, int *srid_out) {
+    if (NIL_P(srid_value)) {
+        *srid_out = 0;
+        return false;
+    }
+
+    if (!RB_INTEGER_TYPE_P(srid_value)) {
+        rb_raise(eTGGeometryArgumentError, "srid: must be an Integer in range [0, 2^31 - 1]");
+    }
+
+    if (RTEST(rb_funcall(srid_value, rb_intern("<"), 1, INT2NUM(0))) ||
+        RTEST(rb_funcall(srid_value, rb_intern(">"), 1, INT2NUM(INT_MAX)))) {
+        rb_raise(eTGGeometryArgumentError, "srid: must be an Integer in range [0, 2^31 - 1]");
+    }
+
+    *srid_out = NUM2INT(srid_value);
+    return true;
+}
+
 static VALUE required_kwargs_value(VALUE kwargs, ID key, const char *name) {
     VALUE value;
 
@@ -652,7 +867,7 @@ static enum tg_geometry_index_predicate parse_index_predicate_symbol(VALUE value
     rb_raise(eTGGeometryArgumentError, "predicate: must be one of :covers, :contains");
 }
 
-static VALUE geom_wrap_owned(struct tg_geom *geom) {
+static VALUE geom_wrap_owned_with_srid(struct tg_geom *geom, bool has_srid, int srid) {
     tg_geom_wrapper_t *w;
     VALUE wrapper;
 
@@ -666,6 +881,8 @@ static VALUE geom_wrap_owned(struct tg_geom *geom) {
     w->geom = geom;
     w->geom_bytes = tg_geom_memsize(geom);
     w->owned = true;
+    w->has_srid = has_srid;
+    w->srid = has_srid ? srid : 0;
 
     if (w->geom_bytes > 0) {
         rb_gc_adjust_memory_usage((ssize_t)w->geom_bytes);
@@ -689,6 +906,8 @@ static VALUE geom_wrap_borrowed(VALUE geom_owner, const struct tg_geom *geom) {
     w->geom = (struct tg_geom *)geom;
     w->geom_bytes = 0;
     w->owned = false;
+    w->has_srid = false;
+    w->srid = 0;
 
     rb_obj_freeze(wrapper);
     RB_GC_GUARD(geom_owner);
@@ -764,6 +983,8 @@ static VALUE parse_string_with_format(VALUE input, enum tg_geometry_parse_format
     struct tg_geom *geom = NULL;
     const char *data;
     size_t len;
+    bool has_srid = false;
+    int srid = 0;
 
     StringValue(input);
     data = RSTRING_PTR(input);
@@ -780,9 +1001,11 @@ static VALUE parse_string_with_format(VALUE input, enum tg_geometry_parse_format
         geom = tg_parse_wktn_ix(data, len, index);
         break;
     case TG_GEOMETRY_FORMAT_WKB:
+        extract_ewkb_srid((const uint8_t *)data, len, &has_srid, &srid);
         geom = tg_parse_wkb_ix((const uint8_t *)data, len, index);
         break;
     case TG_GEOMETRY_FORMAT_HEX:
+        extract_hex_ewkb_srid(data, len, &has_srid, &srid);
         geom = tg_parse_hexn_ix(data, len, index);
         break;
     case TG_GEOMETRY_FORMAT_GEOBIN:
@@ -791,7 +1014,7 @@ static VALUE parse_string_with_format(VALUE input, enum tg_geometry_parse_format
     }
 
     raise_parse_error_from_geom(geom);
-    return geom_wrap_owned(geom);
+    return geom_wrap_owned_with_srid(geom, has_srid, srid);
 }
 
 static VALUE rb_tg_geometry_parse(int argc, VALUE *argv, VALUE self) {
@@ -804,6 +1027,10 @@ static VALUE rb_tg_geometry_parse(int argc, VALUE *argv, VALUE self) {
 
     (void)self;
     rb_scan_args(argc, argv, "1:", &input, &kwargs);
+    {
+        ID allowed[] = {id_format, id_index};
+        validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
+    }
 
     format_value = kwargs_value(kwargs, id_format, ID2SYM(id_auto));
     index_value = kwargs_value(kwargs, id_index, ID2SYM(id_ystripes));
@@ -821,6 +1048,10 @@ static VALUE rb_tg_geometry_parse_geojson(int argc, VALUE *argv, VALUE self) {
 
     (void)self;
     rb_scan_args(argc, argv, "1:", &input, &kwargs);
+    {
+        ID allowed[] = {id_index};
+        validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
+    }
 
     index_value = kwargs_value(kwargs, id_index, ID2SYM(id_ystripes));
     index = parse_index_symbol(index_value);
@@ -836,6 +1067,10 @@ static VALUE rb_tg_geometry_parse_wkt(int argc, VALUE *argv, VALUE self) {
 
     (void)self;
     rb_scan_args(argc, argv, "1:", &input, &kwargs);
+    {
+        ID allowed[] = {id_index};
+        validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
+    }
 
     index_value = kwargs_value(kwargs, id_index, ID2SYM(id_ystripes));
     index = parse_index_symbol(index_value);
@@ -851,6 +1086,10 @@ static VALUE rb_tg_geometry_parse_wkb(int argc, VALUE *argv, VALUE self) {
 
     (void)self;
     rb_scan_args(argc, argv, "1:", &input, &kwargs);
+    {
+        ID allowed[] = {id_index};
+        validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
+    }
 
     index_value = kwargs_value(kwargs, id_index, ID2SYM(id_ystripes));
     index = parse_index_symbol(index_value);
@@ -866,6 +1105,10 @@ static VALUE rb_tg_geometry_parse_hex(int argc, VALUE *argv, VALUE self) {
 
     (void)self;
     rb_scan_args(argc, argv, "1:", &input, &kwargs);
+    {
+        ID allowed[] = {id_index};
+        validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
+    }
 
     index_value = kwargs_value(kwargs, id_index, ID2SYM(id_ystripes));
     index = parse_index_symbol(index_value);
@@ -881,6 +1124,10 @@ static VALUE rb_tg_geometry_parse_geobin(int argc, VALUE *argv, VALUE self) {
 
     (void)self;
     rb_scan_args(argc, argv, "1:", &input, &kwargs);
+    {
+        ID allowed[] = {id_index};
+        validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
+    }
 
     index_value = kwargs_value(kwargs, id_index, ID2SYM(id_ystripes));
     index = parse_index_symbol(index_value);
@@ -916,11 +1163,15 @@ static void validate_rect_coordinates(double min_x, double min_y, double max_x, 
     }
 }
 
-static VALUE wrap_constructed_geom(struct tg_geom *geom) {
+static VALUE wrap_constructed_geom_with_srid(struct tg_geom *geom, bool has_srid, int srid) {
     raise_geom_error_and_free_as(geom, eTGGeometryError, "TG geometry allocation failed",
                                  "TG geometry error message is too large",
                                  "TG geometry error message allocation failed");
-    return geom_wrap_owned(geom);
+    return geom_wrap_owned_with_srid(geom, has_srid, srid);
+}
+
+static VALUE wrap_constructed_geom(struct tg_geom *geom) {
+    return wrap_constructed_geom_with_srid(geom, false, 0);
 }
 
 static VALUE rb_tg_geometry_point(VALUE self, VALUE x_value, VALUE y_value) {
@@ -1021,6 +1272,395 @@ static VALUE rb_tg_geometry_empty_multipolygon(VALUE self) {
 static VALUE rb_tg_geometry_empty_geometrycollection(VALUE self) {
     (void)self;
     return wrap_constructed_geom(tg_geom_new_geometrycollection_empty());
+}
+
+typedef struct {
+    VALUE points_value;
+    struct tg_point *points;
+    long len;
+    const char *label;
+} tg_parse_points_args_t;
+
+static VALUE parse_points_body(VALUE arg) {
+    tg_parse_points_args_t *args = (tg_parse_points_args_t *)arg;
+
+    for (long i = 0; i < args->len; i++) {
+        VALUE pair = rb_ary_entry(args->points_value, i);
+        VALUE x_value;
+        VALUE y_value;
+        double x;
+        double y;
+
+        if (!RB_TYPE_P(pair, T_ARRAY) || RARRAY_LEN(pair) != 2) {
+            rb_raise(eTGGeometryArgumentError, "%s point %ld must be [x, y]", args->label, i);
+        }
+
+        x_value = rb_ary_entry(pair, 0);
+        y_value = rb_ary_entry(pair, 1);
+        x = NUM2DBL(x_value);
+        y = NUM2DBL(y_value);
+        if (!isfinite(x)) {
+            rb_raise(eTGGeometryArgumentError, "%s point %ld x must be finite", args->label, i);
+        }
+        if (!isfinite(y)) {
+            rb_raise(eTGGeometryArgumentError, "%s point %ld y must be finite", args->label, i);
+        }
+
+        args->points[i].x = x;
+        args->points[i].y = y;
+    }
+
+    return Qnil;
+}
+
+static struct tg_point *parse_points_array(VALUE points_value, long *len_out, const char *label) {
+    tg_parse_points_args_t args;
+    int state = 0;
+
+    if (!RB_TYPE_P(points_value, T_ARRAY)) {
+        rb_raise(rb_eTypeError, "%s must be an Array", label);
+    }
+
+    args.len = RARRAY_LEN(points_value);
+    args.points_value = points_value;
+    args.label = label;
+    args.points = NULL;
+
+    if (args.len > INT_MAX) {
+        rb_raise(eTGGeometryArgumentError, "%s has too many points", label);
+    }
+
+    if (args.len > 0) {
+        args.points = (struct tg_point *)ruby_xcalloc((size_t)args.len, sizeof(struct tg_point));
+    }
+
+    rb_protect(parse_points_body, (VALUE)&args, &state);
+    if (state) {
+        ruby_xfree(args.points);
+        rb_jump_tag(state);
+    }
+
+    *len_out = args.len;
+    return args.points;
+}
+
+static struct tg_ring *build_ring_from_ruby(VALUE ring_value, enum tg_index index,
+                                            const char *label, long min_points,
+                                            const char *min_message, const char *closed_message) {
+    struct tg_point *points;
+    struct tg_ring *ring;
+    long len;
+
+    points = parse_points_array(ring_value, &len, label);
+    if (len < min_points) {
+        ruby_xfree(points);
+        rb_raise(eTGGeometryArgumentError, "%s", min_message);
+    }
+    if (len <= 0 || points[0].x != points[len - 1].x || points[0].y != points[len - 1].y) {
+        ruby_xfree(points);
+        rb_raise(eTGGeometryArgumentError, "%s", closed_message);
+    }
+
+    ring = tg_ring_new_ix(points, (int)len, index);
+    ruby_xfree(points);
+    if (!ring) {
+        rb_raise(rb_eNoMemError, "TG ring allocation failed");
+    }
+
+    return ring;
+}
+
+typedef struct {
+    VALUE exterior_value;
+    VALUE holes_value;
+    enum tg_index index;
+    struct tg_ring *exterior;
+    struct tg_ring **holes;
+    long nholes;
+    struct tg_poly *poly;
+} tg_build_poly_args_t;
+
+static void build_poly_cleanup(tg_build_poly_args_t *args) {
+    if (!args) {
+        return;
+    }
+
+    if (args->exterior) {
+        tg_ring_free(args->exterior);
+        args->exterior = NULL;
+    }
+
+    if (args->holes) {
+        for (long i = 0; i < args->nholes; i++) {
+            if (args->holes[i]) {
+                tg_ring_free(args->holes[i]);
+                args->holes[i] = NULL;
+            }
+        }
+        ruby_xfree(args->holes);
+        args->holes = NULL;
+    }
+
+    args->nholes = 0;
+}
+
+static VALUE build_poly_body(VALUE arg) {
+    tg_build_poly_args_t *args = (tg_build_poly_args_t *)arg;
+
+    args->exterior = build_ring_from_ruby(args->exterior_value, args->index, "polygon exterior", 4,
+                                          "polygon exterior ring requires at least 4 points",
+                                          "polygon exterior ring is not closed");
+
+    if (!NIL_P(args->holes_value) && !RB_TYPE_P(args->holes_value, T_ARRAY)) {
+        rb_raise(rb_eTypeError, "holes: must be an Array");
+    }
+
+    args->nholes = NIL_P(args->holes_value) ? 0 : RARRAY_LEN(args->holes_value);
+    if (args->nholes > INT_MAX) {
+        rb_raise(eTGGeometryArgumentError, "polygon has too many holes");
+    }
+
+    if (args->nholes > 0) {
+        args->holes =
+            (struct tg_ring **)ruby_xcalloc((size_t)args->nholes, sizeof(struct tg_ring *));
+        for (long i = 0; i < args->nholes; i++) {
+            char label[64];
+            char min_message[96];
+            char closed_message[96];
+            VALUE hole_value = rb_ary_entry(args->holes_value, i);
+            snprintf(label, sizeof(label), "polygon hole %ld", i);
+            snprintf(min_message, sizeof(min_message),
+                     "polygon hole %ld requires at least 4 points", i);
+            snprintf(closed_message, sizeof(closed_message), "polygon hole %ld is not closed", i);
+            args->holes[i] = build_ring_from_ruby(hole_value, args->index, label, 4, min_message,
+                                                  closed_message);
+        }
+    }
+
+    args->poly =
+        tg_poly_new(args->exterior, (const struct tg_ring *const *)args->holes, (int)args->nholes);
+    if (!args->poly) {
+        rb_raise(rb_eNoMemError, "TG polygon allocation failed");
+    }
+
+    return Qnil;
+}
+
+static struct tg_poly *build_poly_from_ruby(VALUE exterior_value, VALUE holes_value,
+                                            enum tg_index index) {
+    tg_build_poly_args_t args;
+    int state = 0;
+
+    args.exterior_value = exterior_value;
+    args.holes_value = holes_value;
+    args.index = index;
+    args.exterior = NULL;
+    args.holes = NULL;
+    args.nholes = 0;
+    args.poly = NULL;
+
+    rb_protect(build_poly_body, (VALUE)&args, &state);
+    build_poly_cleanup(&args);
+
+    if (state) {
+        rb_jump_tag(state);
+    }
+
+    return args.poly;
+}
+
+static VALUE rb_tg_geometry_line_string(int argc, VALUE *argv, VALUE self) {
+    VALUE points_value;
+    VALUE kwargs;
+    VALUE index_value;
+    VALUE srid_value;
+    enum tg_index index;
+    bool has_srid;
+    int srid;
+    struct tg_point *points;
+    long len;
+    struct tg_line *line;
+    struct tg_geom *geom;
+
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &points_value, &kwargs);
+    {
+        ID allowed[] = {id_index, id_srid};
+        validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
+    }
+
+    index_value = kwargs_value(kwargs, id_index, ID2SYM(id_natural));
+    srid_value = kwargs_value(kwargs, id_srid, Qnil);
+    index = parse_index_symbol(index_value);
+    has_srid = parse_srid_option(srid_value, &srid);
+
+    points = parse_points_array(points_value, &len, "line_string");
+    if (len < 2) {
+        ruby_xfree(points);
+        rb_raise(eTGGeometryArgumentError, "line_string requires at least 2 points, got %ld", len);
+    }
+
+    line = tg_line_new_ix(points, (int)len, index);
+    ruby_xfree(points);
+    if (!line) {
+        rb_raise(rb_eNoMemError, "TG line allocation failed");
+    }
+
+    geom = tg_geom_new_linestring(line);
+    tg_line_free(line);
+    return wrap_constructed_geom_with_srid(geom, has_srid, srid);
+}
+
+static VALUE rb_tg_geometry_polygon(int argc, VALUE *argv, VALUE self) {
+    VALUE exterior_value;
+    VALUE kwargs;
+    VALUE holes_value;
+    VALUE index_value;
+    VALUE srid_value;
+    enum tg_index index;
+    bool has_srid;
+    int srid;
+    struct tg_poly *poly;
+    struct tg_geom *geom;
+
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &exterior_value, &kwargs);
+    {
+        ID allowed[] = {id_holes, id_index, id_srid};
+        validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
+    }
+
+    holes_value = kwargs_value(kwargs, id_holes, Qnil);
+    index_value = kwargs_value(kwargs, id_index, ID2SYM(id_ystripes));
+    srid_value = kwargs_value(kwargs, id_srid, Qnil);
+    index = parse_index_symbol(index_value);
+    has_srid = parse_srid_option(srid_value, &srid);
+
+    poly = build_poly_from_ruby(exterior_value, holes_value, index);
+    geom = tg_geom_new_polygon(poly);
+    tg_poly_free(poly);
+
+    return wrap_constructed_geom_with_srid(geom, has_srid, srid);
+}
+
+typedef struct {
+    VALUE polygons_value;
+    enum tg_index index;
+    long npolys;
+    struct tg_poly **polys;
+    long built;
+    struct tg_geom *geom;
+} tg_build_multipolygon_args_t;
+
+static void build_multipolygon_cleanup(tg_build_multipolygon_args_t *args) {
+    if (!args || !args->polys) {
+        return;
+    }
+
+    for (long i = 0; i < args->built; i++) {
+        if (args->polys[i]) {
+            tg_poly_free(args->polys[i]);
+            args->polys[i] = NULL;
+        }
+    }
+
+    ruby_xfree(args->polys);
+    args->polys = NULL;
+    args->built = 0;
+}
+
+static VALUE build_multipolygon_body(VALUE arg) {
+    tg_build_multipolygon_args_t *args = (tg_build_multipolygon_args_t *)arg;
+
+    args->polys = (struct tg_poly **)ruby_xcalloc((size_t)args->npolys, sizeof(struct tg_poly *));
+
+    for (long i = 0; i < args->npolys; i++) {
+        VALUE item = rb_ary_entry(args->polygons_value, i);
+        VALUE exterior_value;
+        VALUE holes_value = Qnil;
+
+        if (RB_TYPE_P(item, T_HASH)) {
+            ID allowed[] = {id_exterior, id_holes};
+            validate_keywords(item, allowed, sizeof(allowed) / sizeof(allowed[0]));
+
+            exterior_value = rb_hash_aref(item, ID2SYM(id_exterior));
+            holes_value = kwargs_value(item, id_holes, Qnil);
+            if (NIL_P(exterior_value)) {
+                rb_raise(eTGGeometryArgumentError, "multi_polygon polygon %ld requires :exterior",
+                         i);
+            }
+        } else if (RB_TYPE_P(item, T_ARRAY)) {
+            exterior_value = item;
+        } else {
+            rb_raise(rb_eTypeError, "multi_polygon polygon %ld must be a Hash or Array", i);
+        }
+
+        args->polys[i] = build_poly_from_ruby(exterior_value, holes_value, args->index);
+        args->built = i + 1;
+    }
+
+    args->geom =
+        tg_geom_new_multipolygon((const struct tg_poly *const *)args->polys, (int)args->npolys);
+    if (!args->geom) {
+        rb_raise(rb_eNoMemError, "TG multipolygon allocation failed");
+    }
+
+    return Qnil;
+}
+
+static VALUE rb_tg_geometry_multi_polygon(int argc, VALUE *argv, VALUE self) {
+    VALUE polygons_value;
+    VALUE kwargs;
+    VALUE index_value;
+    VALUE srid_value;
+    enum tg_index index;
+    bool has_srid;
+    int srid;
+    long npolys;
+    tg_build_multipolygon_args_t args;
+    int state = 0;
+
+    (void)self;
+    rb_scan_args(argc, argv, "1:", &polygons_value, &kwargs);
+    {
+        ID allowed[] = {id_index, id_srid};
+        validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
+    }
+
+    if (!RB_TYPE_P(polygons_value, T_ARRAY)) {
+        rb_raise(rb_eTypeError, "polygons must be an Array");
+    }
+
+    index_value = kwargs_value(kwargs, id_index, ID2SYM(id_ystripes));
+    srid_value = kwargs_value(kwargs, id_srid, Qnil);
+    index = parse_index_symbol(index_value);
+    has_srid = parse_srid_option(srid_value, &srid);
+
+    npolys = RARRAY_LEN(polygons_value);
+    if (npolys > INT_MAX) {
+        rb_raise(eTGGeometryArgumentError, "multi_polygon has too many polygons");
+    }
+
+    if (npolys == 0) {
+        return wrap_constructed_geom_with_srid(tg_geom_new_multipolygon_empty(), has_srid, srid);
+    }
+
+    args.polygons_value = polygons_value;
+    args.index = index;
+    args.npolys = npolys;
+    args.polys = NULL;
+    args.built = 0;
+    args.geom = NULL;
+
+    rb_protect(build_multipolygon_body, (VALUE)&args, &state);
+    build_multipolygon_cleanup(&args);
+
+    if (state) {
+        rb_jump_tag(state);
+    }
+
+    RB_GC_GUARD(polygons_value);
+    return wrap_constructed_geom_with_srid(args.geom, has_srid, srid);
 }
 
 static VALUE rect_build(double min_x, double min_y, double max_x, double max_y) {
@@ -1313,6 +1953,21 @@ static VALUE rb_tg_geometry_rect_expand_to_include_point(VALUE self, VALUE x_val
     return rect_build(min_x, min_y, max_x, max_y);
 }
 
+static int parse_required_srid_value(VALUE srid_value) {
+    int srid;
+
+    if (NIL_P(srid_value) || !parse_srid_option(srid_value, &srid)) {
+        rb_raise(eTGGeometryArgumentError, "srid: must be an Integer in range [0, 2^31 - 1]");
+    }
+
+    return srid;
+}
+
+static VALUE rb_tg_geometry_geom_srid(VALUE self) {
+    tg_geom_wrapper_t *w = get_geom_wrapper(self);
+    return w->has_srid ? INT2NUM(w->srid) : Qnil;
+}
+
 static VALUE rb_tg_geometry_geom_type(VALUE self) {
     tg_geom_wrapper_t *w = get_geom_wrapper(self);
 
@@ -1509,6 +2164,96 @@ static VALUE binary_writer_result(size_t (*writer)(const struct tg_geom *, uint8
 static VALUE rb_tg_geometry_geom_to_wkb(VALUE self) {
     tg_geom_wrapper_t *w = get_geom_wrapper(self);
     return binary_writer_result(tg_geom_wkb, w->geom, "WKB");
+}
+
+typedef struct {
+    long len;
+} tg_str_alloc_args_t;
+
+static VALUE tg_str_new_binary_body(VALUE arg) {
+    tg_str_alloc_args_t *args = (tg_str_alloc_args_t *)arg;
+    VALUE str = rb_str_new(NULL, args->len);
+    rb_enc_associate(str, rb_ascii8bit_encoding());
+    return str;
+}
+
+static VALUE rb_tg_geometry_geom_to_ewkb(int argc, VALUE *argv, VALUE self) {
+    tg_geom_wrapper_t *w = get_geom_wrapper(self);
+    VALUE kwargs;
+    VALUE srid_value;
+    VALUE out;
+    tg_str_alloc_args_t str_args;
+    uint8_t *plain_buf;
+    uint8_t *out_buf;
+    size_t required;
+    size_t written;
+    uint8_t byte_order;
+    uint32_t type;
+    int effective_srid;
+    bool explicit_srid;
+    int state = 0;
+
+    rb_scan_args(argc, argv, "0:", &kwargs);
+    {
+        ID allowed[] = {id_srid};
+        validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
+    }
+    explicit_srid = kwargs_has_key(kwargs, id_srid);
+
+    if (explicit_srid) {
+        srid_value = rb_hash_aref(kwargs, ID2SYM(id_srid));
+        effective_srid = parse_required_srid_value(srid_value);
+    } else if (w->has_srid) {
+        effective_srid = w->srid;
+    } else {
+        rb_raise(eTGGeometryArgumentError, "to_ewkb requires srid (geom has no srid metadata)");
+    }
+
+    required = tg_geom_wkb(w->geom, NULL, 0);
+    if (required < 5) {
+        rb_raise(eTGGeometryError, "TG WKB writer produced an invalid header");
+    }
+    if (required > (size_t)LONG_MAX - 4) {
+        rb_raise(rb_eNoMemError, "serialized EWKB output is too large");
+    }
+
+    plain_buf = (uint8_t *)ruby_xmalloc(required);
+    written = tg_geom_wkb(w->geom, plain_buf, required);
+    if (written != required) {
+        ruby_xfree(plain_buf);
+        rb_raise(eTGGeometryError, "TG WKB writer size changed during serialization");
+    }
+
+    byte_order = plain_buf[0];
+    if (byte_order > 1) {
+        ruby_xfree(plain_buf);
+        rb_raise(eTGGeometryError, "TG WKB writer produced invalid byte order");
+    }
+
+    type = tg_geometry_read_u32(plain_buf + 1, byte_order);
+    if ((type & 0x20000000u) != 0) {
+        ruby_xfree(plain_buf);
+        rb_raise(eTGGeometryError, "TG WKB writer unexpectedly produced EWKB SRID flag");
+    }
+    type |= 0x20000000u;
+
+    str_args.len = (long)(required + 4);
+    out = rb_protect(tg_str_new_binary_body, (VALUE)&str_args, &state);
+    if (state) {
+        ruby_xfree(plain_buf);
+        rb_jump_tag(state);
+    }
+
+    out_buf = (uint8_t *)RSTRING_PTR(out);
+    out_buf[0] = byte_order;
+    tg_geometry_write_u32(out_buf + 1, type, byte_order);
+    tg_geometry_write_u32(out_buf + 5, (uint32_t)effective_srid, byte_order);
+    memcpy(out_buf + 9, plain_buf + 5, required - 5);
+    ruby_xfree(plain_buf);
+
+    rb_obj_freeze(out);
+    RB_GC_GUARD(out);
+    return out;
 }
 
 static VALUE rb_tg_geometry_geom_to_hex(VALUE self) {
@@ -1953,6 +2698,210 @@ static VALUE rb_tg_geometry_segment_intersects_p(VALUE self, VALUE other) {
     tg_segment_wrapper_t *other_w = get_segment_wrapper(other);
 
     return tg_segment_intersects_segment(w->segment, other_w->segment) ? Qtrue : Qfalse;
+}
+
+typedef struct {
+    struct tg_point query;
+    struct tg_segment best_segment;
+    long best_index;
+    double best_distance;
+    bool found;
+} tg_nearest_segment_ctx_t;
+
+static tg_nearest_segment_wrapper_t *get_nearest_segment_wrapper(VALUE value) {
+    tg_nearest_segment_wrapper_t *w;
+
+    TypedData_Get_Struct(value, tg_nearest_segment_wrapper_t, &tg_nearest_segment_type, w);
+    if (!w || !w->initialized) {
+        rb_raise(eTGGeometryArgumentError, "invalid TG::Geometry::NearestSegment");
+    }
+
+    return w;
+}
+
+static double point_to_segment_distance(struct tg_point p, struct tg_segment seg) {
+    double ax = seg.a.x;
+    double ay = seg.a.y;
+    double bx = seg.b.x;
+    double by = seg.b.y;
+    double dx = bx - ax;
+    double dy = by - ay;
+    double len_sq = dx * dx + dy * dy;
+    double t;
+    double proj_x;
+    double proj_y;
+
+    if (len_sq == 0.0) {
+        return hypot(p.x - ax, p.y - ay);
+    }
+
+    t = ((p.x - ax) * dx + (p.y - ay) * dy) / len_sq;
+    if (t < 0.0)
+        t = 0.0;
+    if (t > 1.0)
+        t = 1.0;
+
+    proj_x = ax + t * dx;
+    proj_y = ay + t * dy;
+    return hypot(p.x - proj_x, p.y - proj_y);
+}
+
+static struct tg_point project_point_onto_segment(struct tg_point p, struct tg_segment seg) {
+    double ax = seg.a.x;
+    double ay = seg.a.y;
+    double bx = seg.b.x;
+    double by = seg.b.y;
+    double dx = bx - ax;
+    double dy = by - ay;
+    double len_sq = dx * dx + dy * dy;
+    double t;
+    struct tg_point projected;
+
+    if (len_sq == 0.0) {
+        projected.x = ax;
+        projected.y = ay;
+        return projected;
+    }
+
+    t = ((p.x - ax) * dx + (p.y - ay) * dy) / len_sq;
+    if (t < 0.0)
+        t = 0.0;
+    if (t > 1.0)
+        t = 1.0;
+
+    projected.x = ax + t * dx;
+    projected.y = ay + t * dy;
+    return projected;
+}
+
+static double nearest_rect_distance(struct tg_rect rect, int *more, void *udata) {
+    tg_nearest_segment_ctx_t *ctx = (tg_nearest_segment_ctx_t *)udata;
+    double dx = 0.0;
+    double dy = 0.0;
+
+    *more = 0;
+
+    if (ctx->query.x < rect.min.x) {
+        dx = rect.min.x - ctx->query.x;
+    } else if (ctx->query.x > rect.max.x) {
+        dx = ctx->query.x - rect.max.x;
+    }
+
+    if (ctx->query.y < rect.min.y) {
+        dy = rect.min.y - ctx->query.y;
+    } else if (ctx->query.y > rect.max.y) {
+        dy = ctx->query.y - rect.max.y;
+    }
+
+    return hypot(dx, dy);
+}
+
+static double nearest_segment_distance(struct tg_segment seg, int *more, void *udata) {
+    tg_nearest_segment_ctx_t *ctx = (tg_nearest_segment_ctx_t *)udata;
+    *more = 0;
+    return point_to_segment_distance(ctx->query, seg);
+}
+
+static bool nearest_segment_iter(struct tg_segment seg, double dist, int index, void *udata) {
+    tg_nearest_segment_ctx_t *ctx = (tg_nearest_segment_ctx_t *)udata;
+
+    if (!ctx->found) {
+        ctx->best_segment = seg;
+        ctx->best_index = (long)index;
+        ctx->best_distance = dist;
+        ctx->found = true;
+        return false;
+    }
+
+    return true;
+}
+
+static VALUE nearest_segment_wrap_value(tg_nearest_segment_ctx_t *ctx) {
+    tg_nearest_segment_wrapper_t *w;
+    VALUE wrapper = TypedData_Make_Struct(cTGGeometryNearestSegment, tg_nearest_segment_wrapper_t,
+                                          &tg_nearest_segment_type, w);
+
+    w->segment = ctx->best_segment;
+    w->index = ctx->best_index;
+    w->distance = ctx->best_distance;
+    w->point = project_point_onto_segment(ctx->query, ctx->best_segment);
+    w->initialized = true;
+
+    rb_obj_freeze(wrapper);
+    RB_GC_GUARD(wrapper);
+    return wrapper;
+}
+
+static VALUE rb_tg_geometry_line_nearest_segment(VALUE self, VALUE x_value, VALUE y_value) {
+    tg_line_wrapper_t *w = get_line_wrapper(self);
+    tg_nearest_segment_ctx_t ctx;
+    bool ok;
+
+    ctx.query.x = NUM2DBL(x_value);
+    ctx.query.y = NUM2DBL(y_value);
+    check_finite_double(ctx.query.x, "x");
+    check_finite_double(ctx.query.y, "y");
+    ctx.best_index = -1;
+    ctx.best_distance = INFINITY;
+    ctx.found = false;
+
+    ok = tg_line_nearest_segment(w->line, nearest_rect_distance, nearest_segment_distance,
+                                 nearest_segment_iter, &ctx);
+    if (!ok) {
+        rb_raise(rb_eNoMemError, "nearest segment search failed");
+    }
+    if (!ctx.found) {
+        return Qnil;
+    }
+
+    RB_GC_GUARD(self);
+    return nearest_segment_wrap_value(&ctx);
+}
+
+static VALUE rb_tg_geometry_ring_nearest_segment(VALUE self, VALUE x_value, VALUE y_value) {
+    tg_ring_wrapper_t *w = get_ring_wrapper(self);
+    tg_nearest_segment_ctx_t ctx;
+    bool ok;
+
+    ctx.query.x = NUM2DBL(x_value);
+    ctx.query.y = NUM2DBL(y_value);
+    check_finite_double(ctx.query.x, "x");
+    check_finite_double(ctx.query.y, "y");
+    ctx.best_index = -1;
+    ctx.best_distance = INFINITY;
+    ctx.found = false;
+
+    ok = tg_ring_nearest_segment(w->ring, nearest_rect_distance, nearest_segment_distance,
+                                 nearest_segment_iter, &ctx);
+    if (!ok) {
+        rb_raise(rb_eNoMemError, "nearest segment search failed");
+    }
+    if (!ctx.found) {
+        return Qnil;
+    }
+
+    RB_GC_GUARD(self);
+    return nearest_segment_wrap_value(&ctx);
+}
+
+static VALUE rb_tg_geometry_nearest_segment_segment(VALUE self) {
+    tg_nearest_segment_wrapper_t *w = get_nearest_segment_wrapper(self);
+    return segment_wrap_value(w->segment);
+}
+
+static VALUE rb_tg_geometry_nearest_segment_index(VALUE self) {
+    tg_nearest_segment_wrapper_t *w = get_nearest_segment_wrapper(self);
+    return LONG2NUM(w->index);
+}
+
+static VALUE rb_tg_geometry_nearest_segment_distance(VALUE self) {
+    tg_nearest_segment_wrapper_t *w = get_nearest_segment_wrapper(self);
+    return rb_float_new(w->distance);
+}
+
+static VALUE rb_tg_geometry_nearest_segment_point(VALUE self) {
+    tg_nearest_segment_wrapper_t *w = get_nearest_segment_wrapper(self);
+    return point_array_from_tg_point(w->point);
 }
 
 static tg_index_t *get_index_wrapper(VALUE value) {
@@ -2406,6 +3355,200 @@ static unsigned char *index_intersecting_rect_marks(tg_index_t *idx, struct tg_r
     return marks;
 }
 
+static bool index_geom_query_matches(const struct tg_geom *stored_geom,
+                                     const struct tg_geom *query_geom,
+                                     enum tg_geometry_geom_query_predicate predicate) {
+    switch (predicate) {
+    case TG_GEOMETRY_GEOM_QUERY_INTERSECTS:
+        return tg_geom_intersects(stored_geom, query_geom);
+    case TG_GEOMETRY_GEOM_QUERY_COVERS:
+        return tg_geom_covers(stored_geom, query_geom);
+    case TG_GEOMETRY_GEOM_QUERY_CONTAINS:
+        return tg_geom_contains(stored_geom, query_geom);
+    }
+
+    return false;
+}
+
+enum tg_index_geom_query_status {
+    TG_INDEX_GEOM_QUERY_OK = 0,
+    TG_INDEX_GEOM_QUERY_MATCH_ALLOC_FAILED,
+    TG_INDEX_GEOM_QUERY_RESULT_OVERFLOW,
+    TG_INDEX_GEOM_QUERY_RESULT_ALLOC_FAILED,
+};
+
+static const char *index_geom_query_status_message(enum tg_index_geom_query_status status) {
+    switch (status) {
+    case TG_INDEX_GEOM_QUERY_MATCH_ALLOC_FAILED:
+        return "match buffer allocation failed";
+    case TG_INDEX_GEOM_QUERY_RESULT_OVERFLOW:
+        return "result buffer allocation size overflow";
+    case TG_INDEX_GEOM_QUERY_RESULT_ALLOC_FAILED:
+        return "result buffer allocation failed";
+    case TG_INDEX_GEOM_QUERY_OK:
+        return "ok";
+    }
+
+    return "geometry query failed";
+}
+
+static enum tg_index_geom_query_status rtree_candidate_marks_no_raise(tg_index_t *idx,
+                                                                      struct tg_rect query_rect,
+                                                                      unsigned char **marks_out) {
+    unsigned char *marks;
+    tg_rtree_mark_args_t args;
+    double min[2];
+    double max[2];
+
+    *marks_out = NULL;
+
+    if (idx->len <= 0) {
+        return TG_INDEX_GEOM_QUERY_OK;
+    }
+
+    marks = alloc_match_marks_raw(idx->len);
+    if (!marks) {
+        return TG_INDEX_GEOM_QUERY_MATCH_ALLOC_FAILED;
+    }
+
+    if (idx->rtree) {
+        args.marks = marks;
+        args.len = idx->len;
+        tg_rect_to_arrays(query_rect, min, max);
+        rtree_search(idx->rtree, min, max, rtree_mark_candidate_iter, &args);
+    }
+
+    *marks_out = marks;
+    return TG_INDEX_GEOM_QUERY_OK;
+}
+
+static enum tg_index_geom_query_status
+index_geom_query_collect(tg_index_t *idx, const struct tg_geom *query_geom,
+                         struct tg_rect query_rect, enum tg_geometry_geom_query_predicate predicate,
+                         long **indices_out, long *count_out) {
+    unsigned char *marks = NULL;
+    long *indices = NULL;
+    long count = 0;
+    enum tg_index_geom_query_status status;
+
+    *indices_out = NULL;
+    *count_out = 0;
+
+    if (idx->strategy == TG_GEOMETRY_INDEX_STRATEGY_RTREE) {
+        status = rtree_candidate_marks_no_raise(idx, query_rect, &marks);
+        if (status != TG_INDEX_GEOM_QUERY_OK) {
+            return status;
+        }
+    } else {
+        marks = alloc_match_marks_raw(idx->len);
+        if (!marks) {
+            return TG_INDEX_GEOM_QUERY_MATCH_ALLOC_FAILED;
+        }
+
+        for (long i = 0; i < idx->len; i++) {
+            if (tg_rect_intersects_rect(idx->entries[i].bbox, query_rect)) {
+                marks[i] = 1;
+            }
+        }
+    }
+
+    if (idx->len < 0 || (size_t)idx->len > SIZE_MAX / sizeof(long)) {
+        free(marks);
+        return TG_INDEX_GEOM_QUERY_RESULT_OVERFLOW;
+    }
+
+    indices = (long *)calloc((size_t)idx->len, sizeof(long));
+    if (!indices) {
+        free(marks);
+        return TG_INDEX_GEOM_QUERY_RESULT_ALLOC_FAILED;
+    }
+
+    for (long i = 0; i < idx->len; i++) {
+        if (!marks[i]) {
+            continue;
+        }
+        if (index_geom_query_matches(idx->entries[i].geom, query_geom, predicate)) {
+            indices[count++] = i;
+        }
+    }
+
+    free(marks);
+    *indices_out = indices;
+    *count_out = count;
+    return TG_INDEX_GEOM_QUERY_OK;
+}
+
+typedef struct {
+    tg_index_t *idx;
+    long *indices;
+    long count;
+} tg_build_ids_from_indices_args_t;
+
+static VALUE build_ids_from_indices_body(VALUE arg) {
+    tg_build_ids_from_indices_args_t *args = (tg_build_ids_from_indices_args_t *)arg;
+    VALUE result = rb_ary_new_capa(args->count);
+
+    for (long i = 0; i < args->count; i++) {
+        rb_ary_push(result, args->idx->entries[args->indices[i]].id);
+    }
+
+    return result;
+}
+
+static VALUE build_ids_from_indices_protected(tg_index_t *idx, long *indices, long count) {
+    tg_build_ids_from_indices_args_t args;
+    VALUE result;
+    int state = 0;
+
+    args.idx = idx;
+    args.indices = indices;
+    args.count = count;
+    result = rb_protect(build_ids_from_indices_body, (VALUE)&args, &state);
+    free(indices);
+
+    if (state) {
+        rb_jump_tag(state);
+    }
+
+    return result;
+}
+
+static VALUE index_geom_query_ids(VALUE self, VALUE geom_value,
+                                  enum tg_geometry_geom_query_predicate predicate) {
+    tg_index_t *idx = get_index_wrapper(self);
+    tg_geom_wrapper_t *query_wrapper = get_geom_wrapper(geom_value);
+    struct tg_geom *query_geom = query_wrapper->geom;
+    struct tg_rect query_rect = tg_geom_rect(query_geom);
+    long *indices = NULL;
+    long count = 0;
+    enum tg_index_geom_query_status status;
+
+    if (idx->len == 0) {
+        return rb_ary_new();
+    }
+
+    status = index_geom_query_collect(idx, query_geom, query_rect, predicate, &indices, &count);
+    if (status != TG_INDEX_GEOM_QUERY_OK) {
+        rb_raise(rb_eNoMemError, "%s", index_geom_query_status_message(status));
+    }
+
+    RB_GC_GUARD(self);
+    RB_GC_GUARD(geom_value);
+    return build_ids_from_indices_protected(idx, indices, count);
+}
+
+static VALUE rb_tg_geometry_index_intersecting_geom_ids(VALUE self, VALUE geom) {
+    return index_geom_query_ids(self, geom, TG_GEOMETRY_GEOM_QUERY_INTERSECTS);
+}
+
+static VALUE rb_tg_geometry_index_covering_geom_ids(VALUE self, VALUE geom) {
+    return index_geom_query_ids(self, geom, TG_GEOMETRY_GEOM_QUERY_COVERS);
+}
+
+static VALUE rb_tg_geometry_index_containing_geom_ids(VALUE self, VALUE geom) {
+    return index_geom_query_ids(self, geom, TG_GEOMETRY_GEOM_QUERY_CONTAINS);
+}
+
 typedef struct {
     tg_index_t *idx;
     VALUE entries;
@@ -2605,6 +3748,10 @@ static VALUE rb_tg_geometry_index_build(int argc, VALUE *argv, VALUE klass) {
     int state = 0;
 
     rb_scan_args(argc, argv, "1:", &entries_value, &kwargs);
+    {
+        ID allowed[] = {id_via, id_strategy, id_predicate, id_geometry_index};
+        validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
+    }
 
     if (!RB_TYPE_P(entries_value, T_ARRAY)) {
         rb_raise(rb_eTypeError, "entries must be Array");
@@ -5125,6 +6272,7 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
 
     id_format = rb_intern("format");
     id_index = rb_intern("index");
+    id_srid = rb_intern("srid");
     id_auto = rb_intern("auto");
     id_geojson = rb_intern("geojson");
     id_wkt = rb_intern("wkt");
@@ -5161,6 +6309,8 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     id_multipoint = rb_intern("multipoint");
     id_multilinestring = rb_intern("multilinestring");
     id_geometrycollection = rb_intern("geometrycollection");
+    id_exterior = rb_intern("exterior");
+    id_holes = rb_intern("holes");
 
     mTG = rb_define_module("TG");
     mTGGeometry = rb_define_module_under(mTG, "Geometry");
@@ -5191,10 +6341,14 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
                                0);
     rb_define_singleton_method(mTGGeometry, "empty_geometrycollection",
                                rb_tg_geometry_empty_geometrycollection, 0);
+    rb_define_singleton_method(mTGGeometry, "line_string", rb_tg_geometry_line_string, -1);
+    rb_define_singleton_method(mTGGeometry, "polygon", rb_tg_geometry_polygon, -1);
+    rb_define_singleton_method(mTGGeometry, "multi_polygon", rb_tg_geometry_multi_polygon, -1);
 
     cTGGeometryGeom = rb_define_class_under(mTGGeometry, "Geom", rb_cObject);
     rb_undef_alloc_func(cTGGeometryGeom);
     rb_define_method(cTGGeometryGeom, "type", rb_tg_geometry_geom_type, 0);
+    rb_define_method(cTGGeometryGeom, "srid", rb_tg_geometry_geom_srid, 0);
     rb_define_method(cTGGeometryGeom, "bbox", rb_tg_geometry_geom_bbox, 0);
     rb_define_method(cTGGeometryGeom, "covers_xy?", rb_tg_geometry_geom_covers_xy_p, 2);
     rb_define_method(cTGGeometryGeom, "intersects_xy?", rb_tg_geometry_geom_intersects_xy_p, 2);
@@ -5211,6 +6365,7 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometryGeom, "to_geojson", rb_tg_geometry_geom_to_geojson, 0);
     rb_define_method(cTGGeometryGeom, "to_wkt", rb_tg_geometry_geom_to_wkt, 0);
     rb_define_method(cTGGeometryGeom, "to_wkb", rb_tg_geometry_geom_to_wkb, 0);
+    rb_define_method(cTGGeometryGeom, "to_ewkb", rb_tg_geometry_geom_to_ewkb, -1);
     rb_define_method(cTGGeometryGeom, "to_hex", rb_tg_geometry_geom_to_hex, 0);
     rb_define_method(cTGGeometryGeom, "to_geobin", rb_tg_geometry_geom_to_geobin, 0);
     rb_define_method(cTGGeometryGeom, "extra_json", rb_tg_geometry_geom_extra_json, 0);
@@ -5251,6 +6406,7 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometryLine, "segments", rb_tg_geometry_line_segments, 0);
     rb_define_method(cTGGeometryLine, "length", rb_tg_geometry_line_length, 0);
     rb_define_method(cTGGeometryLine, "clockwise?", rb_tg_geometry_line_clockwise_p, 0);
+    rb_define_method(cTGGeometryLine, "nearest_segment", rb_tg_geometry_line_nearest_segment, 2);
 
     cTGGeometryRing = rb_define_class_under(mTGGeometry, "Ring", rb_cObject);
     rb_undef_alloc_func(cTGGeometryRing);
@@ -5265,6 +6421,7 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometryRing, "perimeter", rb_tg_geometry_ring_perimeter, 0);
     rb_define_method(cTGGeometryRing, "clockwise?", rb_tg_geometry_ring_clockwise_p, 0);
     rb_define_method(cTGGeometryRing, "convex?", rb_tg_geometry_ring_convex_p, 0);
+    rb_define_method(cTGGeometryRing, "nearest_segment", rb_tg_geometry_ring_nearest_segment, 2);
 
     cTGGeometryPolygon = rb_define_class_under(mTGGeometry, "Polygon", rb_cObject);
     rb_undef_alloc_func(cTGGeometryPolygon);
@@ -5282,6 +6439,15 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometrySegment, "points", rb_tg_geometry_segment_points, 0);
     rb_define_method(cTGGeometrySegment, "bbox", rb_tg_geometry_segment_bbox, 0);
     rb_define_method(cTGGeometrySegment, "intersects?", rb_tg_geometry_segment_intersects_p, 1);
+
+    cTGGeometryNearestSegment = rb_define_class_under(mTGGeometry, "NearestSegment", rb_cObject);
+    rb_undef_alloc_func(cTGGeometryNearestSegment);
+    rb_define_method(cTGGeometryNearestSegment, "segment", rb_tg_geometry_nearest_segment_segment,
+                     0);
+    rb_define_method(cTGGeometryNearestSegment, "index", rb_tg_geometry_nearest_segment_index, 0);
+    rb_define_method(cTGGeometryNearestSegment, "distance", rb_tg_geometry_nearest_segment_distance,
+                     0);
+    rb_define_method(cTGGeometryNearestSegment, "point", rb_tg_geometry_nearest_segment_point, 0);
 
     cTGGeometryRect = rb_define_class_under(mTGGeometry, "Rect", rb_cObject);
     rb_define_alloc_func(cTGGeometryRect, rb_tg_geometry_rect_alloc);
@@ -5323,6 +6489,12 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_singleton_method(cTGGeometryIndex, "build", rb_tg_geometry_index_build, -1);
     rb_define_method(cTGGeometryIndex, "find_covering", rb_tg_geometry_index_find_covering, 2);
     rb_define_method(cTGGeometryIndex, "covering_ids", rb_tg_geometry_index_covering_ids, 2);
+    rb_define_method(cTGGeometryIndex, "intersecting_geom_ids",
+                     rb_tg_geometry_index_intersecting_geom_ids, 1);
+    rb_define_method(cTGGeometryIndex, "covering_geom_ids", rb_tg_geometry_index_covering_geom_ids,
+                     1);
+    rb_define_method(cTGGeometryIndex, "containing_geom_ids",
+                     rb_tg_geometry_index_containing_geom_ids, 1);
     rb_define_method(cTGGeometryIndex, "intersecting_rect", rb_tg_geometry_index_intersecting_rect,
                      4);
     rb_define_method(cTGGeometryIndex, "covering_ids_batch_packed",
