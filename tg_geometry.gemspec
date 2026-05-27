@@ -29,6 +29,7 @@ Gem::Specification.new do |spec|
     "lib/**/*.rb",
     "ext/tg_geometry/*.{c,h,rb}",
     "spec/**/*.rb",
+    "spec/fixtures/**/*",
     "benchmark/**/*.rb",
     "benchmark/**/*.txt",
     "docs/**/*.md",
@@ -45,4 +46,5 @@ Gem::Specification.new do |spec|
 
   spec.add_development_dependency "rake", "~> 13.0"
   spec.add_development_dependency "rspec", "~> 3.13"
+  spec.add_development_dependency "activemodel", ">= 6.0"
 end

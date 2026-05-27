@@ -58,6 +58,44 @@ TG::Geometry.parse_geobin(bytes, index: :ystripes)
 
 `TG::Geometry::Geom` objects are immutable and cannot be manually allocated or manually freed from Ruby.
 
+## Constructors
+
+Construct simple planar geometries directly from Ruby arrays without parsing strings or bytes:
+
+```ruby
+line = TG::Geometry.line_string([[0.0, 0.0], [10.0, 0.0]], index: :natural, srid: 4326)
+poly = TG::Geometry.polygon(
+  [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]],
+  holes: [[[2, 2], [4, 2], [4, 4], [2, 4], [2, 2]]],
+  index: :ystripes,
+  srid: 4326
+)
+mp = TG::Geometry.multi_polygon([
+  { exterior: [[0, 0], [1, 0], [1, 1], [0, 0]], holes: [] },
+  [[10, 10], [11, 10], [11, 11], [10, 10]]
+])
+```
+
+Constructors are strict: rings must already be closed, invalid coordinates raise `TG::Geometry::ArgumentError`, and no winding/self-intersection fixes are performed. `srid:` is metadata on the wrapper; it does not alter coordinates or perform reprojection.
+
+## SRID and EWKB
+
+`parse_wkb` and `parse_hex` preserve EWKB SRID metadata when the EWKB SRID flag is present:
+
+```ruby
+geom = TG::Geometry.parse_wkb(postgis_bytea)
+geom.srid # => 4326, 3857, 0, or nil for plain WKB
+```
+
+`to_wkb` always writes plain WKB. Use `to_ewkb` when a PostGIS-compatible SRID-bearing payload is required:
+
+```ruby
+ewkb = geom.to_ewkb              # uses geom.srid
+ewkb = geom.to_ewkb(srid: 4326)  # explicit override
+```
+
+SRID is metadata only. `tg_geometry` does not check SRID compatibility, transform coordinates, or calculate geodesic distances.
+
 ## Rect
 
 ```ruby
@@ -127,7 +165,28 @@ Accepted predicates:
 - `:covers` — default for geofencing; boundary points are included.
 - `:contains` — stricter containment semantics.
 
+The `predicate:` option affects only the legacy point-based query methods (`find_covering`, `covering_ids(x, y)`, `covering_ids_batch_packed`). The geometry-based query methods (`intersecting_geom_ids`, `covering_geom_ids`, `containing_geom_ids`) use their own predicates based on the method name.
+
 `strategy: :auto` is intentionally not exposed. Choose the strategy explicitly and benchmark on your own data.
+
+## Geometry-based index queries
+
+```ruby
+query = TG::Geometry.polygon([[1, 1], [2, 1], [2, 2], [1, 1]])
+index.intersecting_geom_ids(query)
+index.covering_geom_ids(query)
+index.containing_geom_ids(query)
+```
+
+Predicate direction is explicit:
+
+| Method | Predicate direction | Boundary semantics |
+| --- | --- | --- |
+| `intersecting_geom_ids(query)` | stored geom intersects query | any intersection |
+| `covering_geom_ids(query)` | stored geom covers query | boundary included |
+| `containing_geom_ids(query)` | stored geom contains query | strict interior; boundary excluded |
+
+Results are ids only and preserve insertion order. Duplicate ids remain possible if duplicate ids were inserted.
 
 ## GeoJSON FeatureSource
 
@@ -186,6 +245,20 @@ index.covering_ids_batch_packed(points)
 
 Input is a Ruby String containing native-endian doubles in `lon, lat` pairs. Length must be a multiple of 16 bytes. Empty string returns `[]`.
 
+## Nearest segment
+
+`Line#nearest_segment(x, y)` and `Ring#nearest_segment(x, y)` return a frozen `TG::Geometry::NearestSegment`:
+
+```ruby
+nearest = polygon.polygon.exterior_ring.nearest_segment(5, 5)
+nearest.segment   # => TG::Geometry::Segment
+nearest.index     # => segment index
+nearest.distance  # => Float
+nearest.point     # => [x, y] projection on the segment
+```
+
+Distance is planar Euclidean distance in input coordinate units. It is not meters unless your input coordinates are already meters. Equal-distance tie-breaks follow tg iteration order and are not API-stable.
+
 ## Registry helper
 
 `Registry` is Ruby-level sugar over immutable indexes:
@@ -208,6 +281,23 @@ registry.find_covering(5, 5)
 
 Reload builds a new immutable index first and swaps the reference only after a successful build. Existing readers keep using the previous index safely.
 
+## ActiveRecord integration — read-only
+
+`TG::Geometry::ActiveRecordType` is an optional read-only convenience type for PostGIS columns. It is not required by `tg/geometry`; load it explicitly:
+
+```ruby
+require "tg/geometry/active_record_type"
+
+class Zone < ApplicationRecord
+  attribute :geom, TG::Geometry::ActiveRecordType.new
+end
+
+zone.geom.srid
+zone.geom.covers_xy?(lon, lat)
+```
+
+It can deserialize EWKB bytes, hex EWKB, `\x`-prefixed hex EWKB, GeoJSON, and WKT. Writing `Geom` values is intentionally unsupported in v0.3.0. User applications need `activemodel >= 6.0`; `activerecord` is not a gem dependency.
+
 ## Memory and concurrency
 
 The implementation uses explicit allocator pairs and Ruby GC accounting for native memory. `ObjectSpace.memsize_of(index)` includes entries, owned TG geometries, and exact rtree allocation bytes. Borrowed geometries are not double-counted by the index.
@@ -229,6 +319,9 @@ bundle exec ruby benchmark/rss_stability.rb
 bundle exec ruby benchmark/gvl_threshold.rb
 bundle exec ruby benchmark/falcon_concurrency.rb
 bundle exec ruby benchmark/feature_source.rb
+bundle exec ruby benchmark/geom_query.rb
+bundle exec ruby benchmark/nearest_segment.rb
+bundle exec ruby benchmark/ewkb_roundtrip.rb
 ```
 
 The benchmarks are engineering tools, not marketing claims.
@@ -239,20 +332,20 @@ The benchmarks are engineering tools, not marketing claims.
 
 Not included:
 
-- geocoding;
-- routing;
-- projections;
-- geodesic distance/area;
-- buffer / union / difference / overlay result geometry operations;
-- nearest POI index;
-- Rails dependency in the native extension;
-- Redis or external service dependency;
-- public callback/search APIs;
-- Ractor support claim;
-- no-GVL execution claim;
-- universal `:auto` strategy.
+- Geodesic / Haversine distance;
+- Projection / reprojection;
+- Buffer / union / difference / convex hull;
+- Index nearest_ids (KNN);
+- GeoBIN bbox helpers;
+- Streaming FeatureSource;
+- Index serialization / mmap;
+- Ractor support;
+- Windows / JRuby;
+- Write-side ActiveRecordType / AR scopes / migrations;
+- Z/M variants of array constructors;
+- Public `release_gvl:` option.
 
-TG works in planar XY coordinates. If lon/lat coordinates are passed in, length, area, and perimeter-style values are in input coordinate units, not meters.
+TG works in planar XY coordinates. If lon/lat coordinates are passed in, length, area, perimeter, and nearest-segment distances are in input coordinate units, not meters.
 
 ## Development
 

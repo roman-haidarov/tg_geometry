@@ -1,0 +1,83 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "inside_simple"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "boundary_simple"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          0.0,
+          5.0
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "hole_center"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          3.0,
+          3.0
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "between_hole_and_outer"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          1.0,
+          1.0
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "large_inside"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          100.0,
+          50.0
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "name": "large_outside"
+      },
+      "geometry": {
+        "type": "Point",
+        "coordinates": [
+          200.0,
+          50.0
+        ]
+      }
+    }
+  ]
+}
