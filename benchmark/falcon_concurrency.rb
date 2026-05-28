@@ -3,23 +3,30 @@
 require_relative "_support"
 
 TGGeometryBench.say_header("falcon_concurrency")
-puts "No Falcon dependency is used here. This is a thread-read baseline for the immutable Index model."
-puts "Falcon/Async behavior remains an Pending decision until Roman approves a dedicated dependency/setup."
+TGGeometryBench.report("falcon_concurrency_note", note: "thread_read_baseline_only_no_falcon_dependency")
 
-entries = TGGeometryBench.compact_entries(1_000)
+entries_count = TGGeometryBench.env_integer("TGEOMETRY_BENCH_ENTRIES", 1_000, min: 1)
+threads = TGGeometryBench.env_integer("TGEOMETRY_BENCH_THREADS", 4, min: 1)
+entries = TGGeometryBench.compact_entries(entries_count)
 index = TGGeometryBench.build_index(entries, strategy: :rtree)
-threads = Integer(ENV.fetch("TGEOMETRY_BENCH_THREADS", "4"))
-iterations = TGGeometryBench.iterations(10_000)
+points = TGGeometryBench.points_for(:compact)
 
-elapsed = Benchmark.realtime do
-  threads.times.map do
+stats = TGGeometryBench.measure_counted(
+  initial_iterations: TGGeometryBench.initial_iterations(2_000),
+  operations_per_iteration: threads
+) do |iterations_per_thread|
+  threads.times.map do |thread_index|
     Thread.new do
-      iterations.times do |i|
-        lon, lat = TGGeometryBench.points_for(:compact)[i % 3]
+      iterations_per_thread.times do |i|
+        lon, lat = points[(i + thread_index) % points.length]
         index.find_covering(lon, lat)
       end
     end
   end.each(&:join)
 end
 
-puts "threads=#{threads} iterations_per_thread=#{iterations} total_queries=#{threads * iterations} seconds=%.6f qps=%.2f" % [elapsed, (threads * iterations) / elapsed]
+TGGeometryBench.report(
+  "falcon_concurrency",
+  { threads: threads, entries: entries_count, strategy: :rtree, operation: :find_covering },
+  stats: stats
+)

@@ -3,12 +3,9 @@
 require_relative "_support"
 
 TGGeometryBench.say_header("gvl_threshold")
-puts "First release intentionally performs parse/write/batch/query with GVL held."
-puts "This harness records baseline parse wall time only; it does not enable no-GVL execution."
+TGGeometryBench.report("gvl_threshold_note", note: "baseline_only_gvl_is_held_no_public_release_gvl_knob")
 
-# Build one valid WKT polygon close to the requested byte size.  The previous
-# implementation accidentally benchmarked the same tiny 39-byte polygon for all
-# target sizes because it used Array(...).first.
+# Build one valid WKT polygon close to the requested byte size.
 def polygon_wkt_at_least(target_bytes)
   points_count = [4, target_bytes / 38].max
 
@@ -27,15 +24,17 @@ def polygon_wkt_at_least(target_bytes)
   end
 end
 
-sizes = [128, 1_024, 16_384, 262_144]
-iterations = TGGeometryBench.iterations(2_000)
-
-sizes.each do |target_bytes|
+[128, 1_024, 16_384, 262_144].each do |target_bytes|
   payload = polygon_wkt_at_least(target_bytes)
+  initial = target_bytes >= 262_144 ? 10 : 500
 
-  time = Benchmark.realtime do
+  stats = TGGeometryBench.measure_counted(initial_iterations: TGGeometryBench.initial_iterations(initial)) do |iterations|
     iterations.times { TG::Geometry.parse_wkt(payload) }
   end
 
-  puts "target_bytes=#{target_bytes} payload_bytes=#{payload.bytesize} iterations=#{iterations} seconds=%.6f ops_per_sec=%.2f" % [time, iterations / time]
+  TGGeometryBench.report(
+    "gvl_threshold_parse_wkt",
+    { target_bytes: target_bytes, payload_bytes: payload.bytesize },
+    stats: stats
+  )
 end
