@@ -3127,6 +3127,43 @@ static bool rtree_mark_candidate_iter(const double *min, const double *max, cons
     return true;
 }
 
+typedef struct {
+    const tg_index_t *idx;
+    const struct tg_geom *point;
+    const tg_index_entry_t *best;
+    long best_ordinal;
+} tg_rtree_find_args_t;
+
+static bool rtree_find_covering_iter(const double *min, const double *max, const void *data,
+                                     void *udata) {
+    const tg_index_entry_t *entry = (const tg_index_entry_t *)data;
+    tg_rtree_find_args_t *args = (tg_rtree_find_args_t *)udata;
+
+    (void)min;
+    (void)max;
+
+    if (!entry) {
+        return true;
+    }
+
+    if (entry->ordinal < 0 || entry->ordinal >= args->idx->len) {
+        return true;
+    }
+
+    if (args->best && entry->ordinal >= args->best_ordinal) {
+        return true;
+    }
+    if (index_entry_matches_point(args->idx, entry, args->point)) {
+        args->best = entry;
+        args->best_ordinal = entry->ordinal;
+
+        if (entry->ordinal == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static unsigned char *rtree_candidate_marks(tg_index_t *idx, struct tg_rect query_rect) {
     unsigned char *marks;
     tg_rtree_mark_args_t args;
@@ -3195,33 +3232,31 @@ static VALUE index_find_covering_value(tg_index_t *idx, double lon, double lat) 
 
     if (idx->strategy == TG_GEOMETRY_INDEX_STRATEGY_RTREE) {
         struct tg_rect point_rect = tg_rect_from_xyxy(lon, lat, lon, lat);
-        unsigned char *candidates = rtree_candidate_marks(idx, point_rect);
+        tg_rtree_find_args_t args;
+        double min[2];
+        double max[2];
 
         point = tg_query_point_new(lon, lat);
-        if (!point) {
-            free(candidates);
-            rb_raise(rb_eNoMemError, "TG point geometry allocation failed");
-        }
-        if (tg_geom_error(point)) {
+        tg_query_point_raise_if_invalid(point);
+
+        if (!idx->rtree) {
             tg_geom_free(point);
-            free(candidates);
-            rb_raise(eTGGeometryError, "TG point geometry error");
+            return Qnil;
         }
 
-        for (long i = 0; i < idx->len; i++) {
-            tg_index_entry_t *entry = &idx->entries[i];
+        args.idx = idx;
+        args.point = point;
+        args.best = NULL;
+        args.best_ordinal = 0;
 
-            if (!candidates[i]) {
-                continue;
-            }
-            if (index_entry_matches_point(idx, entry, point)) {
-                result = entry->id;
-                break;
-            }
+        tg_rect_to_arrays(point_rect, min, max);
+        rtree_search(idx->rtree, min, max, rtree_find_covering_iter, &args);
+
+        if (args.best) {
+            result = args.best->id;
         }
 
         tg_geom_free(point);
-        free(candidates);
         return result;
     }
 

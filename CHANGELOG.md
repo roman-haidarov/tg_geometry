@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.1 - 28.05.2026
+
+### Changed
+- Optimized R-tree-backed point lookup by removing per-query candidate bitmap
+allocation and full entry scan from Index#find_covering. The new path tracks
+the lowest matching ordinal directly in the R-tree callback, preserving
+insertion-order semantics while significantly improving rtree point queries
+and packed batch point lookup.
+
 ## 0.3.0 - 27.05.2026
 
 ### Added
