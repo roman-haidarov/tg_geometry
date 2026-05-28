@@ -3,25 +3,67 @@
 require_relative "_support"
 
 TGGeometryBench.say_header("flat_vs_rtree")
-iterations = TGGeometryBench.iterations(1_000)
 
 %i[compact long_thin overlapping].each do |kind|
   TGGeometryBench.sizes.each do |size|
     entries = TGGeometryBench.entries_for(kind, size)
 
-    build_flat = Benchmark.realtime { @flat = TGGeometryBench.build_index(entries, strategy: :flat) }
-    build_rtree = Benchmark.realtime { @rtree = TGGeometryBench.build_index(entries, strategy: :rtree) }
+    flat = nil
+    rtree = nil
 
-    TGGeometryBench.points_for(kind).each do |lon, lat|
-      flat_time = Benchmark.realtime { iterations.times { @flat.find_covering(lon, lat) } }
-      rtree_time = Benchmark.realtime { iterations.times { @rtree.find_covering(lon, lat) } }
-      puts "kind=#{kind} n=#{size} query=point lon=#{lon} lat=#{lat} flat_sec=%.6f rtree_sec=%.6f flat_qps=%.2f rtree_qps=%.2f build_flat=%.6f build_rtree=%.6f" % [flat_time, rtree_time, iterations / flat_time, iterations / rtree_time, build_flat, build_rtree]
+    flat_build = TGGeometryBench.measure_counted(initial_iterations: 1, min_seconds: 0.25) do |iterations|
+      iterations.times { flat = TGGeometryBench.build_index(entries, strategy: :flat) }
+    end
+    rtree_build = TGGeometryBench.measure_counted(initial_iterations: 1, min_seconds: 0.25) do |iterations|
+      iterations.times { rtree = TGGeometryBench.build_index(entries, strategy: :rtree) }
     end
 
-    TGGeometryBench.rects_for(kind).each do |rect|
-      flat_time = Benchmark.realtime { iterations.times { @flat.intersecting_rect(*rect) } }
-      rtree_time = Benchmark.realtime { iterations.times { @rtree.intersecting_rect(*rect) } }
-      puts "kind=#{kind} n=#{size} query=rect rect=#{rect.join(',')} flat_sec=%.6f rtree_sec=%.6f flat_qps=%.2f rtree_qps=%.2f" % [flat_time, rtree_time, iterations / flat_time, iterations / rtree_time]
+    # Rebuild once outside the build benchmark so query numbers do not depend on
+    # the last object produced by calibration/repeats.
+    flat = TGGeometryBench.build_index(entries, strategy: :flat)
+    rtree = TGGeometryBench.build_index(entries, strategy: :rtree)
+
+    TGGeometryBench.report("flat_vs_rtree_build", { kind: kind, n: size, strategy: :flat }, stats: flat_build)
+    TGGeometryBench.report("flat_vs_rtree_build", { kind: kind, n: size, strategy: :rtree }, stats: rtree_build)
+
+    TGGeometryBench.points_for(kind).each_with_index do |(lon, lat), point_index|
+      flat_stats = TGGeometryBench.measure_counted(initial_iterations: TGGeometryBench.initial_iterations(2_000)) do |iterations|
+        iterations.times { flat.find_covering(lon, lat) }
+      end
+      rtree_stats = TGGeometryBench.measure_counted(initial_iterations: TGGeometryBench.initial_iterations(2_000)) do |iterations|
+        iterations.times { rtree.find_covering(lon, lat) }
+      end
+
+      TGGeometryBench.report(
+        "flat_vs_rtree_point",
+        { kind: kind, n: size, strategy: :flat, point_index: point_index, lon: lon, lat: lat },
+        stats: flat_stats
+      )
+      TGGeometryBench.report(
+        "flat_vs_rtree_point",
+        { kind: kind, n: size, strategy: :rtree, point_index: point_index, lon: lon, lat: lat },
+        stats: rtree_stats
+      )
+    end
+
+    TGGeometryBench.rects_for(kind).each_with_index do |rect, rect_index|
+      flat_stats = TGGeometryBench.measure_counted(initial_iterations: TGGeometryBench.initial_iterations(200)) do |iterations|
+        iterations.times { flat.intersecting_rect(*rect) }
+      end
+      rtree_stats = TGGeometryBench.measure_counted(initial_iterations: TGGeometryBench.initial_iterations(200)) do |iterations|
+        iterations.times { rtree.intersecting_rect(*rect) }
+      end
+
+      TGGeometryBench.report(
+        "flat_vs_rtree_rect",
+        { kind: kind, n: size, strategy: :flat, rect_index: rect_index, rect: rect },
+        stats: flat_stats
+      )
+      TGGeometryBench.report(
+        "flat_vs_rtree_rect",
+        { kind: kind, n: size, strategy: :rtree, rect_index: rect_index, rect: rect },
+        stats: rtree_stats
+      )
     end
   end
 end
