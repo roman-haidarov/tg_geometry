@@ -105,7 +105,58 @@ The input length must be a multiple of 16 bytes (two doubles per point).
 The result is an array with one entry per point: the first matching id or
 `nil`.
 
-## 5. Reload pattern
+## 5. Measure distance to a zone
+
+Use `*_xy` when your coordinates are already planar. The distance is returned
+in the same units as the input coordinates:
+
+```ruby
+polygon.distance_to_xy(12, 5)          # => 2.0
+polygon.boundary_distance_to_xy(5, 5)  # => 5.0
+polygon.nearest_point_xy(12, 5)        # => [10.0, 5.0]
+```
+
+For lon/lat GeoJSON, use the explicit `*_lnglat_meters` methods. Coordinate
+order is always `(lng, lat)`, not `(lat, lng)`:
+
+```ruby
+park = TG::Geometry.parse_geojson(<<~JSON)
+  {
+    "type": "Polygon",
+    "coordinates": [[[76.9450, 43.2380], [76.9550, 43.2380],
+                     [76.9550, 43.2460], [76.9450, 43.2460],
+                     [76.9450, 43.2380]]]
+  }
+JSON
+
+park.distance_to_lnglat_meters(76.9500, 43.2420)
+# => 0.0        # point is inside the polygon
+
+park.boundary_distance_to_lnglat_meters(76.9500, 43.2420)
+# => approximate meters to the nearest boundary
+
+park.nearest_point_lnglat(76.9600, 43.2420)
+# => [76.955, 43.242]   # nearest boundary point, raw planar lng/lat
+```
+
+To query an index by radius, use `within_distance_*`:
+
+```ruby
+nearby = index.within_distance_lnglat_meters(76.9500, 43.2420, 250.0, sort: true)
+# => [[:downtown, 0.0], [:delivery_area, 184.3]]
+
+ids = index.within_distance_ids_lnglat_meters(76.9500, 43.2420, 250.0)
+# => [:downtown, :delivery_area]
+```
+
+Lon/lat distance methods return approximate meters using a per-query local
+equirectangular frame. Segments are GeoJSON straight coordinate segments, not
+great-circle arcs. This is intended for local geofencing, warning before a
+boundary, GPS hysteresis, and similar nearby-zone checks — not geodesy.
+Longitude is not wrapped at `+/-180`; cross-antimeridian proximity is out of
+scope and data that crosses the antimeridian should be cut before import.
+
+## 6. Reload pattern
 
 Indexes are immutable. To replace one, build a new index and swap the
 reference. Active readers holding the old reference finish safely; the
@@ -121,8 +172,9 @@ There is no `add`, `delete`, `rebuild!`, or `clear` method — by design.
 
 - Not a full GIS system. No buffer/union/difference, no routing, no
   geocoding, no projections, no nearest-POI index.
-- All coordinates are planar XY. Distances and areas are in input
-  coordinate units, not meters for lon/lat inputs.
+- Not geodesy. Lon/lat distance methods return approximate local meters;
+  XY distance methods return input coordinate units. No projections,
+  reprojections, or great-circle segment distances are performed.
 - No Ractor safety claim. Normal multi-threaded read use is supported and
   tested.
 
