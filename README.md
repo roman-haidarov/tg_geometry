@@ -8,7 +8,25 @@ It exposes the public Ruby namespace `TG::Geometry`:
 require "tg/geometry"
 ```
 
-The gem is focused on fast in-process planar geometry parsing, predicates, format conversion, GeoJSON FeatureCollection imports, and immutable geofencing indexes. It is not a full GIS system.
+The gem is focused on fast in-process planar geometry parsing, predicates, format conversion, GeoJSON FeatureCollection imports, point-to-geometry distance queries, and immutable geofencing indexes. It is not a full GIS system.
+
+## Start here
+
+For runnable examples, use **[GET_STARTED.md](GET_STARTED.md)**.
+
+That guide shows the normal path from install to real queries:
+
+- parsing GeoJSON/WKT/WKB/Hex/GeoBIN;
+- direct Ruby constructors;
+- immutable `Index` builds;
+- point geofencing queries;
+- packed batch point queries;
+- point-to-geometry distance in planar XY and approximate lon/lat meters;
+- GeoJSON FeatureCollection imports;
+- SRID/EWKB conversion;
+- nearest segment helpers;
+- Registry and optional ActiveRecord integration;
+- safe immutable-index reload pattern.
 
 ## Installation
 
@@ -26,317 +44,86 @@ The extension builds from vendored C sources. It does not require GEOS, PostGIS,
 
 Supported platforms: Linux and macOS on x86_64/aarch64. Windows is not supported for the first release.
 
-## Parsing and predicates
-
-```ruby
-zone = TG::Geometry.parse_geojson(<<~JSON)
-  {
-    "type": "Polygon",
-    "coordinates": [[[0,0], [10,0], [10,10], [0,10], [0,0]]]
-  }
-JSON
-
-zone.frozen?          # => true
-zone.type             # => :polygon
-zone.covers_xy?(5, 5) # => true
-zone.covers_xy?(0, 0) # => true, boundary is covered
-zone.bbox             # => #<TG::Geometry::Rect ...>
-zone.to_wkt
-zone.to_wkb
-```
-
-Parse shortcuts:
-
-```ruby
-TG::Geometry.parse(str, format: :auto, index: :ystripes)
-TG::Geometry.parse_geojson(str, index: :ystripes)
-TG::Geometry.parse_wkt(str, index: :ystripes)
-TG::Geometry.parse_wkb(bytes, index: :ystripes)
-TG::Geometry.parse_hex(str, index: :ystripes)
-TG::Geometry.parse_geobin(bytes, index: :ystripes)
-```
-
-`TG::Geometry::Geom` objects are immutable and cannot be manually allocated or manually freed from Ruby.
-
-## Constructors
-
-Construct simple planar geometries directly from Ruby arrays without parsing strings or bytes:
-
-```ruby
-line = TG::Geometry.line_string([[0.0, 0.0], [10.0, 0.0]], index: :natural, srid: 4326)
-poly = TG::Geometry.polygon(
-  [[0, 0], [10, 0], [10, 10], [0, 10], [0, 0]],
-  holes: [[[2, 2], [4, 2], [4, 4], [2, 4], [2, 2]]],
-  index: :ystripes,
-  srid: 4326
-)
-mp = TG::Geometry.multi_polygon([
-  { exterior: [[0, 0], [1, 0], [1, 1], [0, 0]], holes: [] },
-  [[10, 10], [11, 10], [11, 11], [10, 10]]
-])
-```
-
-Constructors are strict: rings must already be closed, invalid coordinates raise `TG::Geometry::ArgumentError`, and no winding/self-intersection fixes are performed. `srid:` is metadata on the wrapper; it does not alter coordinates or perform reprojection.
-
-## SRID and EWKB
-
-`parse_wkb` and `parse_hex` preserve EWKB SRID metadata when the EWKB SRID flag is present:
-
-```ruby
-geom = TG::Geometry.parse_wkb(postgis_bytea)
-geom.srid # => 4326, 3857, 0, or nil for plain WKB
-```
-
-`to_wkb` always writes plain WKB. Use `to_ewkb` when a PostGIS-compatible SRID-bearing payload is required:
-
-```ruby
-ewkb = geom.to_ewkb              # uses geom.srid
-ewkb = geom.to_ewkb(srid: 4326)  # explicit override
-```
+## API map
 
-SRID is metadata only. `tg_geometry` does not check SRID compatibility, transform coordinates, or calculate geodesic distances.
+This README intentionally stays compact. The runnable examples live in [GET_STARTED.md](GET_STARTED.md); deeper design notes live in `docs/`.
 
-## Rect
+### Parsing and format conversion
 
-```ruby
-rect = TG::Geometry::Rect.new(0, 0, 10, 10)
-rect.center                  # => [5.0, 5.0]
-rect.contains_point?(5, 5)   # => true
-rect.intersects?(other_rect)
-rect.expand_to_include(other_rect)
-rect.expand_to_include_point(x, y)
-```
+`TG::Geometry.parse` auto-detects GeoJSON, WKT, WKB, Hex, and GeoBIN. Explicit shortcuts are also available: `parse_geojson`, `parse_wkt`, `parse_wkb`, `parse_hex`, and `parse_geobin`.
 
-`Rect` rejects non-finite coordinates and invalid coordinate order. It is frozen after construction.
+`TG::Geometry::Geom` objects are immutable and can be converted back to WKT/WKB/GeoJSON where supported.
 
-## Immutable Index
+See [GET_STARTED.md#2-parse-a-geometry](GET_STARTED.md#2-parse-a-geometry).
 
-```ruby
-entries = [
-  [:zone_a, '{"type":"Polygon","coordinates":[[[0,0],[10,0],[10,10],[0,10],[0,0]]]}'],
-  [:zone_b, '{"type":"Polygon","coordinates":[[[20,20],[30,20],[30,30],[20,30],[20,20]]]}']
-]
+### Constructors
 
-index = TG::Geometry::Index.build(
-  entries,
-  via: :geojson,
-  strategy: :rtree,
-  predicate: :covers,
-  geometry_index: :ystripes
-)
+Planar geometries can be constructed directly from Ruby arrays without parsing strings or bytes: point, multipoint, line string, polygon, multiline, multipolygon, and geometry collection helpers are available.
 
-index.frozen?               # => true
-index.size                  # => 2
-index.strategy              # => :rtree
-index.predicate             # => :covers
-index.find_covering(5, 5)   # => :zone_a
-index.covering_ids(5, 5)    # => [:zone_a]
-index.intersecting_rect(0, 0, 25, 25)
-```
+See [GET_STARTED.md#3-construct-geometries-directly](GET_STARTED.md#3-construct-geometries-directly).
 
-Accepted input shape:
+### SRID and EWKB
 
-```ruby
-[[id1, object1], [id2, object2], ...]
-```
+EWKB SRID metadata is preserved on parse when present. `to_wkb` writes plain WKB; `to_ewkb` writes a PostGIS-compatible SRID-bearing payload. SRID is metadata only: no coordinate transformation is performed.
 
-Rules:
+See [GET_STARTED.md#8-preserve-srid-and-write-ewkb](GET_STARTED.md#8-preserve-srid-and-write-ewkb) and [docs/SRID_AND_EWKB.md](docs/SRID_AND_EWKB.md).
 
-- `entries` must be an Array.
-- Every entry must be a two-element Array.
-- `id` may be any Ruby object except `nil`.
-- Duplicate ids are allowed.
-- Returned ids are the same Ruby objects stored in the index.
-- Result order is insertion order for both `:flat` and `:rtree`.
+### Rect
 
-Accepted `via:` modes:
+`TG::Geometry::Rect` is an immutable helper for bounding boxes, containment checks, intersections, and expansion.
 
-- `:geom` — borrow an existing `TG::Geometry::Geom` and keep its owner alive.
-- `:geojson` — parse and own native TG geometries inside the index.
-- `:wkb` — parse and own native TG geometries inside the index.
+See [GET_STARTED.md#4-use-rect-helpers](GET_STARTED.md#4-use-rect-helpers).
 
-Accepted strategies:
+### Immutable Index
 
-- `:flat`
-- `:rtree`
+`TG::Geometry::Index` stores immutable entries with explicit `via:`, `strategy:`, and `predicate:` options. `:rtree` builds a spatial index; `:flat` does a linear scan with bbox prefiltering. There is no `:auto` strategy by design.
 
-Accepted predicates:
+See [GET_STARTED.md#5-build-an-immutable-index](GET_STARTED.md#5-build-an-immutable-index).
 
-- `:covers` — default for geofencing; boundary points are included.
-- `:contains` — stricter containment semantics.
+### Point and geometry queries
 
-The `predicate:` option affects only the legacy point-based query methods (`find_covering`, `covering_ids(x, y)`, `covering_ids_batch_packed`). The geometry-based query methods (`intersecting_geom_ids`, `covering_geom_ids`, `containing_geom_ids`) use their own predicates based on the method name.
+Index methods cover point geofencing, packed batch point queries, rectangle intersection, and geometry-vs-geometry predicates.
 
-`strategy: :auto` is intentionally not exposed. Choose the strategy explicitly and benchmark on your own data.
+See:
 
-## Geometry-based index queries
+- [GET_STARTED.md#5-build-an-immutable-index](GET_STARTED.md#5-build-an-immutable-index)
+- [GET_STARTED.md#6-batch-point-queries](GET_STARTED.md#6-batch-point-queries)
+- [docs/GEOMETRY_QUERIES.md](docs/GEOMETRY_QUERIES.md)
 
-```ruby
-query = TG::Geometry.polygon([[1, 1], [2, 1], [2, 2], [1, 1]])
-index.intersecting_geom_ids(query)
-index.covering_geom_ids(query)
-index.containing_geom_ids(query)
-```
+### Point-to-geometry distance
 
-Predicate direction is explicit:
+Distance APIs are explicit about units:
 
-| Method | Predicate direction | Boundary semantics |
-| --- | --- | --- |
-| `intersecting_geom_ids(query)` | stored geom intersects query | any intersection |
-| `covering_geom_ids(query)` | stored geom covers query | boundary included |
-| `containing_geom_ids(query)` | stored geom contains query | strict interior; boundary excluded |
+- `*_xy` returns input coordinate units;
+- `*_lnglat_meters` returns approximate local meters for lon/lat geofencing.
 
-Results are ids only and preserve insertion order. Duplicate ids remain possible if duplicate ids were inserted.
+There is no `metric:` option, no automatic lon/lat-vs-XY detection, no kNN index, and no geodesic/great-circle segment distance.
 
+See [GET_STARTED.md#7-measure-distance-to-a-zone](GET_STARTED.md#7-measure-distance-to-a-zone) and [docs/GEOMETRY_QUERIES.md](docs/GEOMETRY_QUERIES.md).
 
+### GeoJSON FeatureSource
 
-## Point-to-geometry distance
+`TG::Geometry::FeatureSource` reads GeoJSON `FeatureCollection` sources without `JSON.parse` of the whole document into Ruby Hash/Array objects. It can return index entries, feature triples with raw properties JSON, reports, or build an index directly.
 
-`TG::Geometry::Geom` exposes explicit point distance APIs. Units are encoded in the method names; there is no `metric:` option and no automatic lng/lat-vs-XY detection.
+See [GET_STARTED.md#9-import-a-geojson-featurecollection](GET_STARTED.md#9-import-a-geojson-featurecollection) and [docs/FEATURE_SOURCE.md](docs/FEATURE_SOURCE.md).
 
-```ruby
-zone.distance_to_lnglat_meters(lng, lat)          # => Float, approximate meters
-zone.boundary_distance_to_lnglat_meters(lng, lat) # => Float, approximate meters
-zone.nearest_point_lnglat(lng, lat)               # => [lng, lat]
+### Nearest segment
 
-zone.distance_to_xy(x, y)                         # => Float in input coordinate units
-zone.boundary_distance_to_xy(x, y)                # => Float in input coordinate units
-zone.nearest_point_xy(x, y)                       # => [x, y]
-```
+`Line#nearest_segment(x, y)` and `Ring#nearest_segment(x, y)` expose low-level planar nearest-segment helpers.
 
-For areal geometries (`Polygon`, `MultiPolygon`, and areal collection members), `distance_to_*` returns `0.0` for points inside the covered area or on the boundary. Holes are excluded, so a point inside a hole measures to the nearest hole ring. `boundary_distance_to_*` always measures to the nearest boundary/ring/segment; for an interior point it does not return `0.0` merely because the point is covered. `nearest_point_*` returns the nearest boundary point for areal geometries, including interior queries.
+See [GET_STARTED.md#10-use-nearest-segment-helpers](GET_STARTED.md#10-use-nearest-segment-helpers) and [docs/NEAREST_SEGMENT.md](docs/NEAREST_SEGMENT.md).
 
-Distance methods for lng/lat geometries return approximate meters using a per-query local equirectangular frame. Segments are GeoJSON straight coordinate segments, not great-circle arcs. This is geofencing-grade metric distance, not geodesy. Accuracy is intended for local geofencing and degrades with latitude separation.
+### Registry helper
 
-The lng/lat metric is raw planar lng/lat and does not wrap longitude at `+/-180`. A point at `179.9` and a point at `-179.9` are treated as about `360` degrees apart, matching the gem's planar `covers_xy?` model. Data that crosses the antimeridian should be cut at `+/-180` before import.
+`TG::Geometry::Registry` is Ruby-level sugar over immutable indexes with safe reload semantics.
 
-`Index` supports radius filters with an rtree bbox prefilter followed by exact distance filtering:
+See [GET_STARTED.md#11-wrap-an-index-in-a-registry](GET_STARTED.md#11-wrap-an-index-in-a-registry).
 
-```ruby
-index.within_distance_lnglat_meters(lng, lat, radius_m, sort: false)
-# => [[id, distance_m], ...]
-index.within_distance_ids_lnglat_meters(lng, lat, radius_m)
-# => [id, ...]
+### Optional ActiveRecord integration
 
-index.within_distance_xy(x, y, radius, sort: false)
-# => [[id, distance], ...]
-index.within_distance_ids_xy(x, y, radius)
-# => [id, ...]
-```
+`TG::Geometry::ActiveRecordType` is an optional read-only convenience type for PostGIS-like geometry columns. It is not required by `tg/geometry`; load it explicitly.
 
-`sort: true` sorts filtered `[id, distance]` pairs by ascending distance. The ids variants intentionally do not accept `sort:`. Index kNN / `nearest_ids` is not implemented.
-
-Distance radius benchmarks compare `rtree prefilter + exact filter` against a brute-force full index scan. Any ratio from those benchmarks is a prefilter-vs-full-scan result, not a claim that the exact distance calculation itself is hundreds of times faster. The benchmark suite includes tiny-index/full-extent cases where the rtree prefilter may be neutral or slower.
-
-## GeoJSON FeatureSource
-
-`TG::Geometry::FeatureSource` reads GeoJSON `FeatureCollection` sources without `JSON.parse` of the whole document into Ruby Hash/Array objects.
-
-```ruby
-entries = TG::Geometry::FeatureSource.read_entries_file(
-  "zones.geojson",
-  id: ["properties", "@id"],
-  only: [:polygon, :multipolygon]
-)
-
-index = TG::Geometry::Index.build(
-  entries,
-  via: :geojson,
-  strategy: :rtree,
-  predicate: :covers
-)
-```
-
-For imports that also need raw properties JSON:
-
-```ruby
-features = TG::Geometry::FeatureSource.read_features_file(
-  "zones.geojson",
-  id: ["properties", "@id"],
-  report: true,
-  on_invalid: :skip
-)
-
-features[:features].each do |id, geometry_json, properties_json|
-  # Store geometry_json and parse properties_json in application code if needed.
-end
-```
-
-For direct file-to-index loading:
-
-```ruby
-index = TG::Geometry::FeatureSource.build_index_file(
-  "zones.geojson",
-  id: ["properties", "@id"],
-  strategy: :rtree,
-  predicate: :covers
-)
-```
-
-FeatureSource methods are explicit: use `_file` for paths, `_json` for raw content strings, and `_io` for IO objects. There is no path/content auto-detection.
-
-## Packed batch point queries
-
-```ruby
-points = [5.0, 5.0, 25.0, 25.0].pack("d*")
-index.covering_ids_batch_packed(points)
-# => [:zone_a, :zone_b]
-```
-
-Input is a Ruby String containing native-endian doubles in `lon, lat` pairs. Length must be a multiple of 16 bytes. Empty string returns `[]`.
-
-## Nearest segment
-
-`Line#nearest_segment(x, y)` and `Ring#nearest_segment(x, y)` return a frozen `TG::Geometry::NearestSegment`:
-
-```ruby
-nearest = polygon.polygon.exterior_ring.nearest_segment(5, 5)
-nearest.segment   # => TG::Geometry::Segment
-nearest.index     # => segment index
-nearest.distance  # => Float
-nearest.point     # => [x, y] projection on the segment
-```
-
-Distance is planar Euclidean distance in input coordinate units. It is not meters unless your input coordinates are already meters. Equal-distance tie-breaks follow tg iteration order and are not API-stable.
-
-## Registry helper
-
-`Registry` is Ruby-level sugar over immutable indexes:
-
-```ruby
-class DeliveryZones < TG::Geometry::Registry
-  source do
-    [
-      [:zone_a, '{"type":"Polygon","coordinates":[[[0,0],[10,0],[10,10],[0,10],[0,0]]]}']
-    ]
-  end
-
-  index_options via: :geojson, strategy: :rtree, predicate: :covers
-end
-
-registry = DeliveryZones.new
-registry.reload!
-registry.find_covering(5, 5)
-```
-
-Reload builds a new immutable index first and swaps the reference only after a successful build. Existing readers keep using the previous index safely.
-
-## ActiveRecord integration — read-only
-
-`TG::Geometry::ActiveRecordType` is an optional read-only convenience type for PostGIS columns. It is not required by `tg/geometry`; load it explicitly:
-
-```ruby
-require "tg/geometry/active_record_type"
-
-class Zone < ApplicationRecord
-  attribute :geom, TG::Geometry::ActiveRecordType.new
-end
-
-zone.geom.srid
-zone.geom.covers_xy?(lon, lat)
-```
-
-It can deserialize EWKB bytes, hex EWKB, `\x`-prefixed hex EWKB, GeoJSON, and WKT. Writing `Geom` values is intentionally unsupported in v0.3.0. User applications need `activemodel >= 6.0`; `activerecord` is not a gem dependency.
+See [GET_STARTED.md#12-optional-activerecord-read-only-type](GET_STARTED.md#12-optional-activerecord-read-only-type).
 
 ## Memory and concurrency
 
@@ -346,25 +133,13 @@ The implementation uses explicit allocator pairs and Ruby GC accounting for nati
 
 No Ractor support and no universal performance claim are advertised.
 
+See [docs/MEMORY_OWNERSHIP.md](docs/MEMORY_OWNERSHIP.md) and [docs/CONCURRENCY.md](docs/CONCURRENCY.md).
+
 ## Benchmarks
 
-Benchmark scripts live in `benchmark/`:
+Benchmark scripts live in `benchmark/`. They are engineering tools, not marketing claims.
 
-```bash
-bundle exec ruby benchmark/parse_throughput.rb
-bundle exec ruby benchmark/flat_vs_rtree.rb
-bundle exec ruby benchmark/batch_packed_vs_loop.rb
-bundle exec ruby benchmark/objectspace_memsize.rb
-bundle exec ruby benchmark/rss_stability.rb
-bundle exec ruby benchmark/gvl_threshold.rb
-bundle exec ruby benchmark/falcon_concurrency.rb
-bundle exec ruby benchmark/feature_source.rb
-bundle exec ruby benchmark/geom_query.rb
-bundle exec ruby benchmark/nearest_segment.rb
-bundle exec ruby benchmark/ewkb_roundtrip.rb
-```
-
-The benchmarks are engineering tools, not marketing claims.
+Start with [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
 
 ## Limitations
 
@@ -385,7 +160,21 @@ Not included:
 - Z/M variants of array constructors;
 - Public `release_gvl:` option.
 
-TG works in planar XY coordinates. If lon/lat coordinates are passed in, length, area, perimeter, and low-level nearest-segment distances are in input coordinate units, not meters. The explicit `*_lnglat_meters` point-to-geometry APIs are the exception: they return approximate local meters using the query-local frame documented above, not geodesic meters.
+TG works in planar XY coordinates. If lon/lat coordinates are passed in, length, area, perimeter, and low-level nearest-segment distances are in input coordinate units, not meters. The explicit `*_lnglat_meters` point-to-geometry APIs are the exception: they return approximate local meters using a query-local equirectangular frame, not geodesic meters.
+
+See [docs/LIMITATIONS.md](docs/LIMITATIONS.md) for the full list.
+
+## Documentation
+
+- [GET_STARTED.md](GET_STARTED.md) — runnable examples
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the C extension is wired
+- [docs/MEMORY_OWNERSHIP.md](docs/MEMORY_OWNERSHIP.md) — allocator pair table
+- [docs/CONCURRENCY.md](docs/CONCURRENCY.md) — threading rules
+- [docs/ERROR_HANDLING.md](docs/ERROR_HANDLING.md) — exception hierarchy
+- [docs/BENCHMARKING.md](docs/BENCHMARKING.md) — running the benchmark scripts
+- [docs/FEATURE_SOURCE.md](docs/FEATURE_SOURCE.md) — GeoJSON FeatureCollection imports
+- [docs/GEOMETRY_QUERIES.md](docs/GEOMETRY_QUERIES.md) — geometry query details
+- [docs/LIMITATIONS.md](docs/LIMITATIONS.md) — non-goals and accuracy boundaries
 
 ## Development
 
@@ -402,6 +191,7 @@ bundle exec rspec spec/batch_packed_spec.rb
 bundle exec rspec spec/memory_gc_spec.rb
 bundle exec rspec spec/concurrency_spec.rb
 bundle exec rspec spec/fuzz_spec.rb
+bundle exec rspec spec/distance_spec.rb
 ```
 
 ## License
