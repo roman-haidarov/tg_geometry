@@ -188,6 +188,46 @@ Predicate direction is explicit:
 
 Results are ids only and preserve insertion order. Duplicate ids remain possible if duplicate ids were inserted.
 
+
+
+## Point-to-geometry distance
+
+`TG::Geometry::Geom` exposes explicit point distance APIs. Units are encoded in the method names; there is no `metric:` option and no automatic lng/lat-vs-XY detection.
+
+```ruby
+zone.distance_to_lnglat_meters(lng, lat)          # => Float, approximate meters
+zone.boundary_distance_to_lnglat_meters(lng, lat) # => Float, approximate meters
+zone.nearest_point_lnglat(lng, lat)               # => [lng, lat]
+
+zone.distance_to_xy(x, y)                         # => Float in input coordinate units
+zone.boundary_distance_to_xy(x, y)                # => Float in input coordinate units
+zone.nearest_point_xy(x, y)                       # => [x, y]
+```
+
+For areal geometries (`Polygon`, `MultiPolygon`, and areal collection members), `distance_to_*` returns `0.0` for points inside the covered area or on the boundary. Holes are excluded, so a point inside a hole measures to the nearest hole ring. `boundary_distance_to_*` always measures to the nearest boundary/ring/segment; for an interior point it does not return `0.0` merely because the point is covered. `nearest_point_*` returns the nearest boundary point for areal geometries, including interior queries.
+
+Distance methods for lng/lat geometries return approximate meters using a per-query local equirectangular frame. Segments are GeoJSON straight coordinate segments, not great-circle arcs. This is geofencing-grade metric distance, not geodesy. Accuracy is intended for local geofencing and degrades with latitude separation.
+
+The lng/lat metric is raw planar lng/lat and does not wrap longitude at `+/-180`. A point at `179.9` and a point at `-179.9` are treated as about `360` degrees apart, matching the gem's planar `covers_xy?` model. Data that crosses the antimeridian should be cut at `+/-180` before import.
+
+`Index` supports radius filters with an rtree bbox prefilter followed by exact distance filtering:
+
+```ruby
+index.within_distance_lnglat_meters(lng, lat, radius_m, sort: false)
+# => [[id, distance_m], ...]
+index.within_distance_ids_lnglat_meters(lng, lat, radius_m)
+# => [id, ...]
+
+index.within_distance_xy(x, y, radius, sort: false)
+# => [[id, distance], ...]
+index.within_distance_ids_xy(x, y, radius)
+# => [id, ...]
+```
+
+`sort: true` sorts filtered `[id, distance]` pairs by ascending distance. The ids variants intentionally do not accept `sort:`. Index kNN / `nearest_ids` is not implemented.
+
+Distance radius benchmarks compare `rtree prefilter + exact filter` against a brute-force full index scan. Any ratio from those benchmarks is a prefilter-vs-full-scan result, not a claim that the exact distance calculation itself is hundreds of times faster. The benchmark suite includes tiny-index/full-extent cases where the rtree prefilter may be neutral or slower.
+
 ## GeoJSON FeatureSource
 
 `TG::Geometry::FeatureSource` reads GeoJSON `FeatureCollection` sources without `JSON.parse` of the whole document into Ruby Hash/Array objects.
@@ -345,7 +385,7 @@ Not included:
 - Z/M variants of array constructors;
 - Public `release_gvl:` option.
 
-TG works in planar XY coordinates. If lon/lat coordinates are passed in, length, area, perimeter, and nearest-segment distances are in input coordinate units, not meters.
+TG works in planar XY coordinates. If lon/lat coordinates are passed in, length, area, perimeter, and low-level nearest-segment distances are in input coordinate units, not meters. The explicit `*_lnglat_meters` point-to-geometry APIs are the exception: they return approximate local meters using the query-local frame documented above, not geodesic meters.
 
 ## Development
 

@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.2 - unreleased
+
+### Added
+
+- Added explicit point-to-geometry distance APIs on `TG::Geometry::Geom`:
+  `distance_to_lnglat_meters`, `boundary_distance_to_lnglat_meters`,
+  `nearest_point_lnglat`, `distance_to_xy`, `boundary_distance_to_xy`, and
+  `nearest_point_xy`.
+- Added `TG::Geometry::Index#within_distance_lnglat_meters`,
+  `#within_distance_ids_lnglat_meters`, `#within_distance_xy`, and
+  `#within_distance_ids_xy` using bbox prefilter plus exact distance filtering.
+- Added distance specs and benchmarks for point-to-geometry and radius queries, including
+  tiny-index/full-extent radius cases and distance receiver memory-accounting checks.
+
+### Clarified
+
+- lng/lat distance is approximate local equirectangular meters for local geofencing,
+  not geodesic distance; GeoJSON segments remain straight coordinate segments.
+- The lng/lat metric is raw planar and does not wrap or split at the antimeridian.
+- Distance query methods keep the GVL and do not claim Falcon/Async/Ractor behavior.
+
 ## 0.3.1 - 28.05.2026
 
 ### Changed

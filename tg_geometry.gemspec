@@ -8,8 +8,8 @@ Gem::Specification.new do |spec|
   spec.authors       = ["Roman Haydarov"]
   spec.email         = ["romnhajdarov@gmail.com"]
 
-  spec.summary       = "Native extension for TG::Geometry parsing, predicates, immutable indexes, FeatureSource imports, registries, low-level wrappers, and packed point batches"
-  spec.description   = "Defines TG::Geometry with immutable Geom parsing and constructor wrappers, expanded geometry predicates and accessors, Rect helpers, Hex/GeoBIN writers, raw extra_json access, read-only borrowed Line/Ring/Polygon and GeometryCollection child wrappers, value Segment wrappers, Registry reload sugar, optional ActiveRecord source helpers, and an immutable geofencing-oriented Index with owned and borrowed geometry ingestion, flat/rtree strategies, deterministic ordered id results, exact rtree allocation accounting, and native-endian packed point batch queries, and FeatureSource GeoJSON FeatureCollection extraction/build paths over vendored C sources. Ractor support is not claimed."
+  spec.summary       = "Native extension for TG::Geometry parsing, predicates, immutable indexes, FeatureSource imports, registries, low-level wrappers, packed point batches, and local distance queries"
+  spec.description   = "Defines TG::Geometry with immutable Geom parsing and constructor wrappers, expanded geometry predicates and accessors, Rect helpers, Hex/GeoBIN writers, raw extra_json access, read-only borrowed Line/Ring/Polygon and GeometryCollection child wrappers, value Segment wrappers, Registry reload sugar, optional ActiveRecord source helpers, and an immutable geofencing-oriented Index with owned and borrowed geometry ingestion, flat/rtree strategies, deterministic ordered id results, exact rtree allocation accounting, and native-endian packed point batch queries, explicit local point-to-geometry distance/radius queries, and FeatureSource GeoJSON FeatureCollection extraction/build paths over vendored C sources. Ractor support is not claimed."
   spec.homepage      = "https://github.com/roman-haidarov/tg_geometry"
   spec.license       = "MIT"
   spec.required_ruby_version = ">= 3.1"
