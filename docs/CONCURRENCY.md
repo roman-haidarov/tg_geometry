@@ -69,3 +69,11 @@ No Falcon or Async performance claim is made. `benchmark/falcon_concurrency.rb` 
 ## Low-level borrowed wrappers
 
 `TG::Geometry::Line`, `TG::Geometry::Ring`, `TG::Geometry::Polygon`, and borrowed GeometryCollection child `TG::Geometry::Geom` wrappers are immutable borrowed wrappers. They do not mutate or free child TG pointers. Each wrapper marks and compacts the parent `TG::Geometry::Geom` through `geom_owner`, so the parent native geometry remains alive while a child wrapper is in use.
+
+## Distance query concurrency
+
+Point-to-geometry distance methods are read-only over immutable `Geom` and `Index` objects. They do not mutate geometry, mutate index entries, cache query state on receivers, or add persistent native memory. They do not call `rb_gc_adjust_memory_usage`.
+
+`Index#within_distance_*` uses rtree callbacks only to mark candidate ordinals in C memory. Ruby arrays and `[id, distance]` pairs are materialized after `rtree_search` returns under the GVL. The callback safety rules above apply unchanged.
+
+Distance methods deliberately keep the GVL. Do not treat them as no-GVL, Falcon/Async-aware, or Ractor-shareable APIs.

@@ -15,6 +15,9 @@ The repository includes these benchmark entry points:
 - `benchmark/falcon_concurrency.rb`
 - `benchmark/objectspace_memsize.rb`
 - `benchmark/rss_stability.rb`
+- `benchmark/distance_point_geom.rb`
+- `benchmark/distance_within_radius.rb`
+- `benchmark/distance_memory_accounting.rb`
 
 Run after compiling the extension:
 
@@ -42,7 +45,11 @@ Benchmark generators cover:
 - flat vs rtree;
 - scalar vs packed batch;
 - parse small/medium/large geometry strings;
-- RSS stability over repeated build/query/free.
+- RSS stability over repeated build/query/free;
+- point-to-geometry distance over different vertex counts;
+- radius search as `rtree prefilter + exact filter` versus brute-force full index scan;
+- tiny-index/full-extent radius cases where the rtree prefilter may not help;
+- distance receiver memory accounting before and after repeated calls.
 
 ## Output format
 
@@ -53,6 +60,26 @@ kind=compact n=1000 query=point lon=0.4 lat=0.4 flat_sec=... rtree_sec=... flat_
 ```
 
 These records are intentionally plain text so they can be redirected to files and compared across machines.
+
+
+## Distance benchmarks
+
+`benchmark/distance_point_geom.rb` measures point-to-geometry distance method cost over geometries with different vertex counts. The `*_lnglat_meters` rows measure the local equirectangular frame overhead; they are not geodesic benchmarks.
+
+`benchmark/distance_within_radius.rb` compares two query strategies:
+
+- `rtree_prefilter_exact_filter`: existing rtree bbox prefilter followed by exact distance filtering;
+- `brute_force_full_scan`: direct scan over every geometry with the same exact distance method.
+
+Any speedup ratio from this script is a prefilter-vs-full-scan result. It must not be described as “distance is N times faster”. The benchmark intentionally includes selective-radius cases where the index should help and tiny-index/full-extent-radius cases where the prefilter may be neutral or slower. If rtree still wins on a machine, document that measured result instead of inventing a crossover.
+
+`benchmark/distance_memory_accounting.rb` checks `ObjectSpace.memsize_of` before and after repeated distance calls. The expected receiver `delta B` is `0`; Ruby result allocations are still expected for returned arrays and `[id, distance]` pairs.
+
+For noisy rows, especially short selective radius runs, increase timing before publishing numbers:
+
+```bash
+TGEOMETRY_BENCH_MIN_SECONDS=1.0 bundle exec ruby benchmark/distance_within_radius.rb
+```
 
 ## No `:auto` strategy yet
 

@@ -292,7 +292,7 @@ module TGGeometryBench
     :rect_index, :rect,
     :segments, :target_bytes, :payload_bytes,
     :points_per_batch, :threads,
-    :entries, :rebuilds, :cycle
+    :entries, :rebuilds, :cycle, :receiver
   ].freeze
 
   TABLE_METRIC_COLUMNS = [
@@ -302,7 +302,8 @@ module TGGeometryBench
     :iterations, :operations,
     :geom_memsize, :flat_memsize, :rtree_memsize, :rtree_over_flat,
     :start_rss_kb, :peak_rss_kb, :finish_rss_kb, :drift_kb, :max_drift_kb,
-    :elapsed_sec, :queries, :sample_count, :rss_kb
+    :elapsed_sec, :queries, :sample_count, :rss_kb,
+    :before_memsize, :after_memsize, :delta_memsize, :allocated_objects
   ].freeze
 
   TABLE_INTERNAL_COLUMNS = [
@@ -348,6 +349,7 @@ module TGGeometryBench
     rebuilds: "rebuilds",
     queries: "queries",
     cycle: "cycle",
+    receiver: "receiver",
     rss_kb: "rss KB",
     geom_memsize: "geom B",
     flat_memsize: "flat B",
@@ -359,7 +361,11 @@ module TGGeometryBench
     drift_kb: "drift KB",
     max_drift_kb: "max drift KB",
     elapsed_sec: "elapsed s",
-    sample_count: "samples"
+    sample_count: "samples",
+    before_memsize: "before B",
+    after_memsize: "after B",
+    delta_memsize: "delta B",
+    allocated_objects: "alloc objs"
   }.freeze
 
   def human_int(value)
@@ -407,7 +413,8 @@ module TGGeometryBench
          :rss_kb, :geom_memsize, :flat_memsize, :rtree_memsize, :rtree_over_flat,
          :start_rss_kb, :peak_rss_kb, :finish_rss_kb, :drift_kb, :max_drift_kb,
          :target_bytes, :payload_bytes, :segments, :points_per_batch, :threads,
-         :sample_count, :median_minor_gc, :median_major_gc
+         :sample_count, :median_minor_gc, :median_major_gc,
+         :before_memsize, :after_memsize, :delta_memsize, :allocated_objects
       human_int(value)
     when :full, :adaptive, :gc_disabled
       value ? "yes" : "no"

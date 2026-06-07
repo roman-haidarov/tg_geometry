@@ -43,6 +43,30 @@ module TG
       # @!method srid
       #   @return [Integer, nil] SRID metadata; not used for reprojection
       #
+      # @!method distance_to_lnglat_meters(lng, lat)
+      #   Approximate meters in a query-local equirectangular frame. Not geodesy.
+      #   @return [Float]
+      #
+      # @!method boundary_distance_to_lnglat_meters(lng, lat)
+      #   Approximate meters to nearest boundary/segment/point.
+      #   @return [Float]
+      #
+      # @!method nearest_point_lnglat(lng, lat)
+      #   Raw planar nearest boundary/geometry point. Longitude is not wrapped.
+      #   @return [Array(Float, Float)]
+      #
+      # @!method distance_to_xy(x, y)
+      #   Planar distance in input coordinate units.
+      #   @return [Float]
+      #
+      # @!method boundary_distance_to_xy(x, y)
+      #   Planar boundary distance in input coordinate units.
+      #   @return [Float]
+      #
+      # @!method nearest_point_xy(x, y)
+      #   Planar nearest boundary/geometry point in input coordinate units.
+      #   @return [Array(Float, Float)]
+      #
       # @!method to_ewkb(srid: nil)
       #   Writes EWKB with the SRID flag set. Uses explicit srid: when provided,
       #   otherwise Geom#srid. Raises if no SRID is available. to_wkb remains plain.
@@ -68,6 +92,22 @@ module TG
       #   Stored geometries for which tg_geom_contains(stored, query) is true.
       #   Direction: stored contains query. Boundary points are not contained.
       #   @return [Array<Object>] ids in insertion order
+      #
+      # @!method within_distance_lnglat_meters(lng, lat, radius_m, sort: false)
+      #   Rtree bbox prefilter plus exact approximate-meter distance filter.
+      #   @return [Array<Array(Object, Float)>]
+      #
+      # @!method within_distance_ids_lnglat_meters(lng, lat, radius_m)
+      #   Same membership as within_distance_lnglat_meters, ids only.
+      #   @return [Array<Object>]
+      #
+      # @!method within_distance_xy(x, y, radius, sort: false)
+      #   Rtree bbox prefilter plus exact planar distance filter.
+      #   @return [Array<Array(Object, Float)>]
+      #
+      # @!method within_distance_ids_xy(x, y, radius)
+      #   Same membership as within_distance_xy, ids only.
+      #   @return [Array<Object>]
     end
 
     class Line

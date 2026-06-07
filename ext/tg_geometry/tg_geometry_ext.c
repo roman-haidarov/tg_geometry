@@ -199,6 +199,7 @@ static ID id_multilinestring;
 static ID id_geometrycollection;
 static ID id_exterior;
 static ID id_holes;
+static ID id_sort;
 
 #ifdef TG_DEBUG_TEST
 static bool tg_debug_fail_next_entries_alloc = false;
@@ -2904,6 +2905,540 @@ static VALUE rb_tg_geometry_nearest_segment_point(VALUE self) {
     return point_array_from_tg_point(w->point);
 }
 
+static struct tg_geom *tg_query_point_new(double x, double y);
+static void tg_query_point_raise_if_invalid(struct tg_geom *point);
+
+static const double TG_DISTANCE_EARTH_RADIUS_M = 6371008.8;
+static const double TG_DISTANCE_DEG_TO_RAD = 0.017453292519943295769236907684886;
+static const double TG_DISTANCE_RAD_TO_DEG = 57.295779513082320876798154814105;
+static const double TG_DISTANCE_POLE_EPS = 1e-12;
+
+typedef struct {
+    double ref_x;
+    double ref_y;
+    double a;
+    double b;
+} tg_distance_metric_t;
+
+typedef struct {
+    const tg_distance_metric_t *metric;
+    double best_distance;
+    struct tg_point best_point;
+    bool found;
+} tg_distance_accum_t;
+
+typedef struct {
+    const tg_distance_metric_t *metric;
+    struct tg_segment best_segment;
+    long best_index;
+    double best_distance;
+    struct tg_point best_point;
+    bool found;
+} tg_distance_nearest_ctx_t;
+
+typedef struct {
+    VALUE value;
+} tg_coerce_float_args_t;
+
+static VALUE tg_coerce_float_body(VALUE arg) {
+    tg_coerce_float_args_t *args = (tg_coerce_float_args_t *)arg;
+    return rb_Float(args->value);
+}
+
+static double tg_coerce_finite_double(VALUE value, const char *name) {
+    tg_coerce_float_args_t args;
+    VALUE coerced;
+    double result;
+    int state = 0;
+
+    args.value = value;
+    coerced = rb_protect(tg_coerce_float_body, (VALUE)&args, &state);
+    if (state) {
+        rb_set_errinfo(Qnil);
+        rb_raise(eTGGeometryArgumentError, "%s must be Float-coercible and finite", name);
+    }
+
+    result = NUM2DBL(coerced);
+    if (!isfinite(result)) {
+        rb_raise(eTGGeometryArgumentError, "%s must be Float-coercible and finite", name);
+    }
+
+    return result;
+}
+
+static double tg_distance_lng_value(VALUE value) {
+    double lng = tg_coerce_finite_double(value, "lng");
+    if (lng < -180.0 || lng > 180.0) {
+        rb_raise(eTGGeometryArgumentError, "lng must be in [-180.0, 180.0]");
+    }
+    return lng;
+}
+
+static double tg_distance_lat_value(VALUE value) {
+    double lat = tg_coerce_finite_double(value, "lat");
+    if (lat < -90.0 || lat > 90.0) {
+        rb_raise(eTGGeometryArgumentError, "lat must be in [-90.0, 90.0]");
+    }
+    return lat;
+}
+
+static double tg_distance_radius_value(VALUE value, const char *name) {
+    double radius = tg_coerce_finite_double(value, name);
+    if (radius < 0.0) {
+        rb_raise(eTGGeometryArgumentError, "%s must be >= 0.0", name);
+    }
+    return radius;
+}
+
+static void tg_distance_parse_two_no_keywords(int argc, VALUE *argv, VALUE *a, VALUE *b) {
+    VALUE kwargs = Qnil;
+
+    rb_scan_args(argc, argv, "20:", a, b, &kwargs);
+    validate_keywords(kwargs, NULL, 0);
+}
+
+static void tg_distance_metric_xy(tg_distance_metric_t *metric, double x, double y) {
+    metric->ref_x = x;
+    metric->ref_y = y;
+    metric->a = 1.0;
+    metric->b = 1.0;
+}
+
+static void tg_distance_metric_lnglat(tg_distance_metric_t *metric, double lng, double lat) {
+    double lat_ref_rad = lat * TG_DISTANCE_DEG_TO_RAD;
+    double cos_lat = cos(lat_ref_rad);
+
+    if (fabs(cos_lat) < TG_DISTANCE_POLE_EPS) {
+        cos_lat = 0.0;
+    }
+
+    metric->ref_x = lng;
+    metric->ref_y = lat;
+    metric->a = TG_DISTANCE_EARTH_RADIUS_M * TG_DISTANCE_DEG_TO_RAD * cos_lat;
+    metric->b = TG_DISTANCE_EARTH_RADIUS_M * TG_DISTANCE_DEG_TO_RAD;
+}
+
+static struct tg_point tg_distance_map_point(const tg_distance_metric_t *metric,
+                                             struct tg_point point) {
+    struct tg_point mapped;
+    mapped.x = metric->a * (point.x - metric->ref_x);
+    mapped.y = metric->b * (point.y - metric->ref_y);
+    return mapped;
+}
+
+static struct tg_segment tg_distance_map_segment(const tg_distance_metric_t *metric,
+                                                 struct tg_segment seg) {
+    struct tg_segment mapped;
+    mapped.a = tg_distance_map_point(metric, seg.a);
+    mapped.b = tg_distance_map_point(metric, seg.b);
+    return mapped;
+}
+
+static double tg_distance_point_distance(const tg_distance_metric_t *metric,
+                                         struct tg_point point) {
+    struct tg_point mapped = tg_distance_map_point(metric, point);
+    return hypot(mapped.x, mapped.y);
+}
+
+static double tg_distance_origin_to_segment(const tg_distance_metric_t *metric,
+                                            struct tg_segment seg) {
+    struct tg_point origin = {0.0, 0.0};
+    struct tg_segment mapped = tg_distance_map_segment(metric, seg);
+    return point_to_segment_distance(origin, mapped);
+}
+
+static struct tg_point tg_distance_project_raw_point(const tg_distance_metric_t *metric,
+                                                     struct tg_segment raw_seg) {
+    struct tg_segment mapped = tg_distance_map_segment(metric, raw_seg);
+    double dx = mapped.b.x - mapped.a.x;
+    double dy = mapped.b.y - mapped.a.y;
+    double len_sq = dx * dx + dy * dy;
+    double t;
+    struct tg_point result;
+
+    if (len_sq == 0.0) {
+        return raw_seg.a;
+    }
+
+    t = (-(mapped.a.x * dx + mapped.a.y * dy)) / len_sq;
+    if (t < 0.0)
+        t = 0.0;
+    if (t > 1.0)
+        t = 1.0;
+
+    result.x = raw_seg.a.x + t * (raw_seg.b.x - raw_seg.a.x);
+    result.y = raw_seg.a.y + t * (raw_seg.b.y - raw_seg.a.y);
+    return result;
+}
+
+static double tg_distance_metric_rect_distance(struct tg_rect rect,
+                                               const tg_distance_metric_t *metric) {
+    double min_x = metric->a * (rect.min.x - metric->ref_x);
+    double max_x = metric->a * (rect.max.x - metric->ref_x);
+    double min_y = metric->b * (rect.min.y - metric->ref_y);
+    double max_y = metric->b * (rect.max.y - metric->ref_y);
+    double dx = 0.0;
+    double dy = 0.0;
+
+    if (min_x > max_x) {
+        double tmp = min_x;
+        min_x = max_x;
+        max_x = tmp;
+    }
+    if (min_y > max_y) {
+        double tmp = min_y;
+        min_y = max_y;
+        max_y = tmp;
+    }
+
+    if (0.0 < min_x) {
+        dx = min_x;
+    } else if (0.0 > max_x) {
+        dx = -max_x;
+    }
+
+    if (0.0 < min_y) {
+        dy = min_y;
+    } else if (0.0 > max_y) {
+        dy = -max_y;
+    }
+
+    return hypot(dx, dy);
+}
+
+static double tg_distance_nearest_rect_distance(struct tg_rect rect, int *more, void *udata) {
+    tg_distance_nearest_ctx_t *ctx = (tg_distance_nearest_ctx_t *)udata;
+    *more = 0;
+    return tg_distance_metric_rect_distance(rect, ctx->metric);
+}
+
+static double tg_distance_nearest_segment_distance(struct tg_segment seg, int *more, void *udata) {
+    tg_distance_nearest_ctx_t *ctx = (tg_distance_nearest_ctx_t *)udata;
+    *more = 0;
+    return tg_distance_origin_to_segment(ctx->metric, seg);
+}
+
+static bool tg_distance_nearest_segment_iter(struct tg_segment seg, double dist, int index,
+                                             void *udata) {
+    tg_distance_nearest_ctx_t *ctx = (tg_distance_nearest_ctx_t *)udata;
+
+    if (!ctx->found) {
+        ctx->best_segment = seg;
+        ctx->best_index = (long)index;
+        ctx->best_distance = dist;
+        ctx->best_point = tg_distance_project_raw_point(ctx->metric, seg);
+        ctx->found = true;
+        return false;
+    }
+
+    return true;
+}
+
+static void tg_distance_accum_consider(tg_distance_accum_t *accum, double distance,
+                                       struct tg_point point) {
+    if (!isfinite(distance)) {
+        return;
+    }
+
+    if (!accum->found || distance < accum->best_distance) {
+        accum->best_distance = distance;
+        accum->best_point = point;
+        accum->found = true;
+    }
+}
+
+static void tg_distance_accum_point(tg_distance_accum_t *accum, struct tg_point point) {
+    tg_distance_accum_consider(accum, tg_distance_point_distance(accum->metric, point), point);
+}
+
+static bool tg_distance_accum_line(tg_distance_accum_t *accum, const struct tg_line *line) {
+    tg_distance_nearest_ctx_t ctx;
+    bool ok;
+
+    if (!line || tg_line_num_segments(line) <= 0) {
+        return true;
+    }
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.metric = accum->metric;
+    ctx.best_index = -1;
+    ctx.best_distance = INFINITY;
+
+    ok = tg_line_nearest_segment(line, tg_distance_nearest_rect_distance,
+                                 tg_distance_nearest_segment_distance,
+                                 tg_distance_nearest_segment_iter, &ctx);
+    if (!ok) {
+        return false;
+    }
+    if (ctx.found) {
+        tg_distance_accum_consider(accum, ctx.best_distance, ctx.best_point);
+    }
+    return true;
+}
+
+static bool tg_distance_accum_ring(tg_distance_accum_t *accum, const struct tg_ring *ring) {
+    tg_distance_nearest_ctx_t ctx;
+    bool ok;
+
+    if (!ring || tg_ring_num_segments(ring) <= 0) {
+        return true;
+    }
+
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.metric = accum->metric;
+    ctx.best_index = -1;
+    ctx.best_distance = INFINITY;
+
+    ok = tg_ring_nearest_segment(ring, tg_distance_nearest_rect_distance,
+                                 tg_distance_nearest_segment_distance,
+                                 tg_distance_nearest_segment_iter, &ctx);
+    if (!ok) {
+        return false;
+    }
+    if (ctx.found) {
+        tg_distance_accum_consider(accum, ctx.best_distance, ctx.best_point);
+    }
+    return true;
+}
+
+static bool tg_distance_accum_poly(tg_distance_accum_t *accum, const struct tg_poly *poly) {
+    int nholes;
+
+    if (!poly) {
+        return true;
+    }
+
+    if (!tg_distance_accum_ring(accum, tg_poly_exterior(poly))) {
+        return false;
+    }
+
+    nholes = tg_poly_num_holes(poly);
+    for (int i = 0; i < nholes; i++) {
+        if (!tg_distance_accum_ring(accum, tg_poly_hole_at(poly, i))) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool tg_distance_accum_geom(tg_distance_accum_t *accum, const struct tg_geom *geom) {
+    int count;
+
+    if (!geom || tg_geom_is_empty(geom)) {
+        return true;
+    }
+
+    switch (tg_geom_typeof(geom)) {
+    case TG_POINT:
+        tg_distance_accum_point(accum, tg_geom_point(geom));
+        return true;
+    case TG_MULTIPOINT:
+        count = tg_geom_num_points(geom);
+        for (int i = 0; i < count; i++) {
+            tg_distance_accum_point(accum, tg_geom_point_at(geom, i));
+        }
+        return true;
+    case TG_LINESTRING:
+        return tg_distance_accum_line(accum, tg_geom_line(geom));
+    case TG_MULTILINESTRING:
+        count = tg_geom_num_lines(geom);
+        for (int i = 0; i < count; i++) {
+            if (!tg_distance_accum_line(accum, tg_geom_line_at(geom, i))) {
+                return false;
+            }
+        }
+        return true;
+    case TG_POLYGON:
+        return tg_distance_accum_poly(accum, tg_geom_poly(geom));
+    case TG_MULTIPOLYGON:
+        count = tg_geom_num_polys(geom);
+        for (int i = 0; i < count; i++) {
+            if (!tg_distance_accum_poly(accum, tg_geom_poly_at(geom, i))) {
+                return false;
+            }
+        }
+        return true;
+    case TG_GEOMETRYCOLLECTION:
+        count = tg_geom_num_geometries(geom);
+        for (int i = 0; i < count; i++) {
+            if (!tg_distance_accum_geom(accum, tg_geom_geometry_at(geom, i))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    return true;
+}
+
+static bool tg_distance_boundary_result(const struct tg_geom *geom,
+                                        const tg_distance_metric_t *metric, double *distance_out,
+                                        struct tg_point *point_out) {
+    tg_distance_accum_t accum;
+
+    memset(&accum, 0, sizeof(accum));
+    accum.metric = metric;
+    accum.best_distance = INFINITY;
+
+    if (!tg_distance_accum_geom(&accum, geom)) {
+        rb_raise(rb_eNoMemError, "nearest segment search failed");
+    }
+
+    if (!accum.found) {
+        return false;
+    }
+
+    *distance_out = accum.best_distance;
+    *point_out = accum.best_point;
+    return true;
+}
+
+static bool tg_distance_geom_covers_point(const struct tg_geom *geom, double x, double y) {
+    struct tg_geom *point = tg_query_point_new(x, y);
+    bool covered;
+
+    tg_query_point_raise_if_invalid(point);
+    covered = tg_geom_covers(geom, point);
+    tg_geom_free(point);
+    return covered;
+}
+
+static double tg_distance_to_geom(const struct tg_geom *geom, const tg_distance_metric_t *metric,
+                                  double query_x, double query_y) {
+    double distance = 0.0;
+    struct tg_point nearest = {0.0, 0.0};
+
+    if (tg_distance_geom_covers_point(geom, query_x, query_y)) {
+        return 0.0;
+    }
+
+    if (!tg_distance_boundary_result(geom, metric, &distance, &nearest)) {
+        rb_raise(eTGGeometryArgumentError, "geometry has no measurable component");
+    }
+
+    return distance;
+}
+
+static double tg_boundary_distance_to_geom(const struct tg_geom *geom,
+                                           const tg_distance_metric_t *metric) {
+    double distance = 0.0;
+    struct tg_point nearest = {0.0, 0.0};
+
+    if (!tg_distance_boundary_result(geom, metric, &distance, &nearest)) {
+        rb_raise(eTGGeometryArgumentError, "geometry has no measurable component");
+    }
+
+    return distance;
+}
+
+static struct tg_point tg_nearest_point_on_geom(const struct tg_geom *geom,
+                                                const tg_distance_metric_t *metric) {
+    double distance = 0.0;
+    struct tg_point nearest = {0.0, 0.0};
+
+    if (!tg_distance_boundary_result(geom, metric, &distance, &nearest)) {
+        rb_raise(eTGGeometryArgumentError, "geometry has no measurable component");
+    }
+
+    return nearest;
+}
+
+static VALUE rb_tg_geometry_geom_distance_to_xy(int argc, VALUE *argv, VALUE self) {
+    tg_geom_wrapper_t *w = get_geom_wrapper(self);
+    VALUE x_value, y_value;
+    tg_distance_metric_t metric;
+    double x;
+    double y;
+
+    tg_distance_parse_two_no_keywords(argc, argv, &x_value, &y_value);
+    x = tg_coerce_finite_double(x_value, "x");
+    y = tg_coerce_finite_double(y_value, "y");
+
+    tg_distance_metric_xy(&metric, x, y);
+    return rb_float_new(tg_distance_to_geom(w->geom, &metric, x, y));
+}
+
+static VALUE rb_tg_geometry_geom_boundary_distance_to_xy(int argc, VALUE *argv, VALUE self) {
+    tg_geom_wrapper_t *w = get_geom_wrapper(self);
+    VALUE x_value, y_value;
+    tg_distance_metric_t metric;
+    double x;
+    double y;
+
+    tg_distance_parse_two_no_keywords(argc, argv, &x_value, &y_value);
+    x = tg_coerce_finite_double(x_value, "x");
+    y = tg_coerce_finite_double(y_value, "y");
+
+    tg_distance_metric_xy(&metric, x, y);
+    return rb_float_new(tg_boundary_distance_to_geom(w->geom, &metric));
+}
+
+static VALUE rb_tg_geometry_geom_nearest_point_xy(int argc, VALUE *argv, VALUE self) {
+    tg_geom_wrapper_t *w = get_geom_wrapper(self);
+    VALUE x_value, y_value;
+    tg_distance_metric_t metric;
+    struct tg_point nearest;
+    double x;
+    double y;
+
+    tg_distance_parse_two_no_keywords(argc, argv, &x_value, &y_value);
+    x = tg_coerce_finite_double(x_value, "x");
+    y = tg_coerce_finite_double(y_value, "y");
+
+    tg_distance_metric_xy(&metric, x, y);
+    nearest = tg_nearest_point_on_geom(w->geom, &metric);
+    return point_array_from_tg_point(nearest);
+}
+
+static VALUE rb_tg_geometry_geom_distance_to_lnglat_meters(int argc, VALUE *argv, VALUE self) {
+    tg_geom_wrapper_t *w = get_geom_wrapper(self);
+    VALUE lng_value, lat_value;
+    tg_distance_metric_t metric;
+    double lng;
+    double lat;
+
+    tg_distance_parse_two_no_keywords(argc, argv, &lng_value, &lat_value);
+    lng = tg_distance_lng_value(lng_value);
+    lat = tg_distance_lat_value(lat_value);
+
+    tg_distance_metric_lnglat(&metric, lng, lat);
+    return rb_float_new(tg_distance_to_geom(w->geom, &metric, lng, lat));
+}
+
+static VALUE rb_tg_geometry_geom_boundary_distance_to_lnglat_meters(int argc, VALUE *argv,
+                                                                    VALUE self) {
+    tg_geom_wrapper_t *w = get_geom_wrapper(self);
+    VALUE lng_value, lat_value;
+    tg_distance_metric_t metric;
+    double lng;
+    double lat;
+
+    tg_distance_parse_two_no_keywords(argc, argv, &lng_value, &lat_value);
+    lng = tg_distance_lng_value(lng_value);
+    lat = tg_distance_lat_value(lat_value);
+
+    tg_distance_metric_lnglat(&metric, lng, lat);
+    return rb_float_new(tg_boundary_distance_to_geom(w->geom, &metric));
+}
+
+static VALUE rb_tg_geometry_geom_nearest_point_lnglat(int argc, VALUE *argv, VALUE self) {
+    tg_geom_wrapper_t *w = get_geom_wrapper(self);
+    VALUE lng_value, lat_value;
+    tg_distance_metric_t metric;
+    struct tg_point nearest;
+    double lng;
+    double lat;
+
+    tg_distance_parse_two_no_keywords(argc, argv, &lng_value, &lat_value);
+    lng = tg_distance_lng_value(lng_value);
+    lat = tg_distance_lat_value(lat_value);
+
+    tg_distance_metric_lnglat(&metric, lng, lat);
+    nearest = tg_nearest_point_on_geom(w->geom, &metric);
+    return point_array_from_tg_point(nearest);
+}
+
 static tg_index_t *get_index_wrapper(VALUE value) {
     tg_index_t *idx;
 
@@ -3582,6 +4117,292 @@ static VALUE rb_tg_geometry_index_covering_geom_ids(VALUE self, VALUE geom) {
 
 static VALUE rb_tg_geometry_index_containing_geom_ids(VALUE self, VALUE geom) {
     return index_geom_query_ids(self, geom, TG_GEOMETRY_GEOM_QUERY_CONTAINS);
+}
+
+typedef struct {
+    VALUE id;
+    double distance;
+    long ordinal;
+} tg_distance_match_t;
+
+static int tg_distance_match_compare(const void *a, const void *b) {
+    const tg_distance_match_t *ma = (const tg_distance_match_t *)a;
+    const tg_distance_match_t *mb = (const tg_distance_match_t *)b;
+
+    if (ma->distance < mb->distance)
+        return -1;
+    if (ma->distance > mb->distance)
+        return 1;
+    if (ma->ordinal < mb->ordinal)
+        return -1;
+    if (ma->ordinal > mb->ordinal)
+        return 1;
+    return 0;
+}
+
+static bool tg_distance_bbox_intersects(const tg_index_entry_t *entry, struct tg_rect rect) {
+    return tg_rect_intersects_rect(entry->bbox, rect);
+}
+
+static struct tg_rect tg_distance_lnglat_prefilter_rect(double lng, double lat, double radius_m) {
+    double lat_ref_rad = lat * TG_DISTANCE_DEG_TO_RAD;
+    double cos_lat = cos(lat_ref_rad);
+    double delta_lat = (radius_m / TG_DISTANCE_EARTH_RADIUS_M) * TG_DISTANCE_RAD_TO_DEG;
+    double min_lat = lat - delta_lat;
+    double max_lat = lat + delta_lat;
+    double min_lng;
+    double max_lng;
+
+    if (min_lat < -90.0)
+        min_lat = -90.0;
+    if (max_lat > 90.0)
+        max_lat = 90.0;
+
+    if (fabs(cos_lat) < TG_DISTANCE_POLE_EPS) {
+        min_lng = -180.0;
+        max_lng = 180.0;
+    } else {
+        double delta_lng = delta_lat / cos_lat;
+        if (delta_lng >= 180.0) {
+            min_lng = -180.0;
+            max_lng = 180.0;
+        } else {
+            min_lng = lng - delta_lng;
+            max_lng = lng + delta_lng;
+        }
+    }
+
+    return tg_rect_from_xyxy(min_lng, min_lat, max_lng, max_lat);
+}
+
+static unsigned char *tg_distance_candidate_marks(tg_index_t *idx, struct tg_rect query_rect) {
+    unsigned char *marks;
+
+    if (idx->len == 0) {
+        return NULL;
+    }
+
+    if (idx->strategy == TG_GEOMETRY_INDEX_STRATEGY_RTREE) {
+        return rtree_candidate_marks(idx, query_rect);
+    }
+
+    marks = alloc_match_marks(idx->len);
+    for (long i = 0; i < idx->len; i++) {
+        if (tg_distance_bbox_intersects(&idx->entries[i], query_rect)) {
+            marks[i] = 1;
+        }
+    }
+    return marks;
+}
+
+static VALUE tg_distance_build_pairs(tg_distance_match_t *matches, long count) {
+    VALUE result = rb_ary_new_capa(count);
+
+    for (long i = 0; i < count; i++) {
+        VALUE pair = rb_ary_new_capa(2);
+        rb_ary_push(pair, matches[i].id);
+        rb_ary_push(pair, rb_float_new(matches[i].distance));
+        rb_ary_push(result, pair);
+    }
+
+    return result;
+}
+
+static VALUE tg_distance_build_ids(tg_distance_match_t *matches, long count) {
+    VALUE result = rb_ary_new_capa(count);
+
+    for (long i = 0; i < count; i++) {
+        rb_ary_push(result, matches[i].id);
+    }
+
+    return result;
+}
+
+typedef struct {
+    tg_index_t *idx;
+    struct tg_rect query_rect;
+    const tg_distance_metric_t *metric;
+    double query_x;
+    double query_y;
+    double radius;
+    bool sort;
+    bool ids_only;
+    unsigned char *marks;
+    tg_distance_match_t *matches;
+    long count;
+} tg_index_within_distance_args_t;
+
+static VALUE tg_index_within_distance_body(VALUE arg) {
+    tg_index_within_distance_args_t *args = (tg_index_within_distance_args_t *)arg;
+
+    if (args->idx->len == 0) {
+        return rb_ary_new();
+    }
+
+    if ((size_t)args->idx->len > SIZE_MAX / sizeof(*args->matches)) {
+        rb_raise(rb_eNoMemError, "distance result allocation overflow");
+    }
+
+    args->marks = tg_distance_candidate_marks(args->idx, args->query_rect);
+    args->matches = (tg_distance_match_t *)calloc((size_t)args->idx->len, sizeof(*args->matches));
+    if (!args->matches) {
+        rb_raise(rb_eNoMemError, "distance result allocation failed");
+    }
+
+    for (long i = 0; i < args->idx->len; i++) {
+        double distance;
+
+        if (!args->marks[i]) {
+            continue;
+        }
+
+        distance = tg_distance_to_geom(args->idx->entries[i].geom, args->metric, args->query_x,
+                                       args->query_y);
+        if (distance <= args->radius) {
+            args->matches[args->count].id = args->idx->entries[i].id;
+            args->matches[args->count].distance = distance;
+            args->matches[args->count].ordinal = i;
+            args->count++;
+        }
+    }
+
+    if (args->sort && args->count > 1) {
+        qsort(args->matches, (size_t)args->count, sizeof(*args->matches),
+              tg_distance_match_compare);
+    }
+
+    return args->ids_only ? tg_distance_build_ids(args->matches, args->count)
+                          : tg_distance_build_pairs(args->matches, args->count);
+}
+
+static VALUE tg_index_within_distance_ensure(VALUE arg) {
+    tg_index_within_distance_args_t *args = (tg_index_within_distance_args_t *)arg;
+
+    free(args->marks);
+    args->marks = NULL;
+    free(args->matches);
+    args->matches = NULL;
+    return Qnil;
+}
+
+static VALUE tg_index_within_distance_common(tg_index_t *idx, struct tg_rect query_rect,
+                                             const tg_distance_metric_t *metric, double query_x,
+                                             double query_y, double radius, bool sort,
+                                             bool ids_only) {
+    tg_index_within_distance_args_t args;
+
+    memset(&args, 0, sizeof(args));
+    args.idx = idx;
+    args.query_rect = query_rect;
+    args.metric = metric;
+    args.query_x = query_x;
+    args.query_y = query_y;
+    args.radius = radius;
+    args.sort = sort;
+    args.ids_only = ids_only;
+
+    return rb_ensure(tg_index_within_distance_body, (VALUE)&args, tg_index_within_distance_ensure,
+                     (VALUE)&args);
+}
+
+static bool tg_distance_parse_sort_kw(int argc, VALUE *argv, VALUE *a, VALUE *b, VALUE *radius) {
+    VALUE kwargs = Qnil;
+    ID local_allowed[1];
+
+    rb_scan_args(argc, argv, "30:", a, b, radius, &kwargs);
+
+    local_allowed[0] = id_sort;
+    validate_keywords(kwargs, local_allowed, 1);
+    return RTEST(kwargs_value(kwargs, id_sort, Qfalse));
+}
+
+static void tg_distance_parse_no_keywords(int argc, VALUE *argv, VALUE *a, VALUE *b,
+                                          VALUE *radius) {
+    VALUE kwargs = Qnil;
+
+    rb_scan_args(argc, argv, "30:", a, b, radius, &kwargs);
+    validate_keywords(kwargs, NULL, 0);
+}
+
+static VALUE rb_tg_geometry_index_within_distance_xy(int argc, VALUE *argv, VALUE self) {
+    tg_index_t *idx = get_index_wrapper(self);
+    VALUE x_value, y_value, radius_value;
+    tg_distance_metric_t metric;
+    struct tg_rect query_rect;
+    double x;
+    double y;
+    double radius;
+    bool sort = tg_distance_parse_sort_kw(argc, argv, &x_value, &y_value, &radius_value);
+
+    x = tg_coerce_finite_double(x_value, "x");
+    y = tg_coerce_finite_double(y_value, "y");
+    radius = tg_distance_radius_value(radius_value, "radius");
+    tg_distance_metric_xy(&metric, x, y);
+    query_rect = tg_rect_from_xyxy(x - radius, y - radius, x + radius, y + radius);
+
+    RB_GC_GUARD(self);
+    return tg_index_within_distance_common(idx, query_rect, &metric, x, y, radius, sort, false);
+}
+
+static VALUE rb_tg_geometry_index_within_distance_ids_xy(int argc, VALUE *argv, VALUE self) {
+    tg_index_t *idx = get_index_wrapper(self);
+    VALUE x_value, y_value, radius_value;
+    tg_distance_metric_t metric;
+    struct tg_rect query_rect;
+    double x;
+    double y;
+    double radius;
+
+    tg_distance_parse_no_keywords(argc, argv, &x_value, &y_value, &radius_value);
+    x = tg_coerce_finite_double(x_value, "x");
+    y = tg_coerce_finite_double(y_value, "y");
+    radius = tg_distance_radius_value(radius_value, "radius");
+    tg_distance_metric_xy(&metric, x, y);
+    query_rect = tg_rect_from_xyxy(x - radius, y - radius, x + radius, y + radius);
+
+    RB_GC_GUARD(self);
+    return tg_index_within_distance_common(idx, query_rect, &metric, x, y, radius, false, true);
+}
+
+static VALUE rb_tg_geometry_index_within_distance_lnglat_meters(int argc, VALUE *argv, VALUE self) {
+    tg_index_t *idx = get_index_wrapper(self);
+    VALUE lng_value, lat_value, radius_value;
+    tg_distance_metric_t metric;
+    struct tg_rect query_rect;
+    double lng;
+    double lat;
+    double radius;
+    bool sort = tg_distance_parse_sort_kw(argc, argv, &lng_value, &lat_value, &radius_value);
+
+    lng = tg_distance_lng_value(lng_value);
+    lat = tg_distance_lat_value(lat_value);
+    radius = tg_distance_radius_value(radius_value, "radius_m");
+    tg_distance_metric_lnglat(&metric, lng, lat);
+    query_rect = tg_distance_lnglat_prefilter_rect(lng, lat, radius);
+
+    RB_GC_GUARD(self);
+    return tg_index_within_distance_common(idx, query_rect, &metric, lng, lat, radius, sort, false);
+}
+
+static VALUE rb_tg_geometry_index_within_distance_ids_lnglat_meters(int argc, VALUE *argv,
+                                                                    VALUE self) {
+    tg_index_t *idx = get_index_wrapper(self);
+    VALUE lng_value, lat_value, radius_value;
+    tg_distance_metric_t metric;
+    struct tg_rect query_rect;
+    double lng;
+    double lat;
+    double radius;
+
+    tg_distance_parse_no_keywords(argc, argv, &lng_value, &lat_value, &radius_value);
+    lng = tg_distance_lng_value(lng_value);
+    lat = tg_distance_lat_value(lat_value);
+    radius = tg_distance_radius_value(radius_value, "radius_m");
+    tg_distance_metric_lnglat(&metric, lng, lat);
+    query_rect = tg_distance_lnglat_prefilter_rect(lng, lat, radius);
+
+    RB_GC_GUARD(self);
+    return tg_index_within_distance_common(idx, query_rect, &metric, lng, lat, radius, false, true);
 }
 
 typedef struct {
@@ -6346,6 +7167,7 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     id_geometrycollection = rb_intern("geometrycollection");
     id_exterior = rb_intern("exterior");
     id_holes = rb_intern("holes");
+    id_sort = rb_intern("sort");
 
     mTG = rb_define_module("TG");
     mTGGeometry = rb_define_module_under(mTG, "Geometry");
@@ -6397,6 +7219,16 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometryGeom, "touches?", rb_tg_geometry_geom_touches_p, 1);
     rb_define_method(cTGGeometryGeom, "intersects_rect?", rb_tg_geometry_geom_intersects_rect_p,
                      -1);
+    rb_define_method(cTGGeometryGeom, "distance_to_lnglat_meters",
+                     rb_tg_geometry_geom_distance_to_lnglat_meters, -1);
+    rb_define_method(cTGGeometryGeom, "boundary_distance_to_lnglat_meters",
+                     rb_tg_geometry_geom_boundary_distance_to_lnglat_meters, -1);
+    rb_define_method(cTGGeometryGeom, "nearest_point_lnglat",
+                     rb_tg_geometry_geom_nearest_point_lnglat, -1);
+    rb_define_method(cTGGeometryGeom, "distance_to_xy", rb_tg_geometry_geom_distance_to_xy, -1);
+    rb_define_method(cTGGeometryGeom, "boundary_distance_to_xy",
+                     rb_tg_geometry_geom_boundary_distance_to_xy, -1);
+    rb_define_method(cTGGeometryGeom, "nearest_point_xy", rb_tg_geometry_geom_nearest_point_xy, -1);
     rb_define_method(cTGGeometryGeom, "to_geojson", rb_tg_geometry_geom_to_geojson, 0);
     rb_define_method(cTGGeometryGeom, "to_wkt", rb_tg_geometry_geom_to_wkt, 0);
     rb_define_method(cTGGeometryGeom, "to_wkb", rb_tg_geometry_geom_to_wkb, 0);
@@ -6532,6 +7364,14 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
                      rb_tg_geometry_index_containing_geom_ids, 1);
     rb_define_method(cTGGeometryIndex, "intersecting_rect", rb_tg_geometry_index_intersecting_rect,
                      4);
+    rb_define_method(cTGGeometryIndex, "within_distance_lnglat_meters",
+                     rb_tg_geometry_index_within_distance_lnglat_meters, -1);
+    rb_define_method(cTGGeometryIndex, "within_distance_ids_lnglat_meters",
+                     rb_tg_geometry_index_within_distance_ids_lnglat_meters, -1);
+    rb_define_method(cTGGeometryIndex, "within_distance_xy",
+                     rb_tg_geometry_index_within_distance_xy, -1);
+    rb_define_method(cTGGeometryIndex, "within_distance_ids_xy",
+                     rb_tg_geometry_index_within_distance_ids_xy, -1);
     rb_define_method(cTGGeometryIndex, "covering_ids_batch_packed",
                      rb_tg_geometry_index_covering_ids_batch_packed, 1);
     rb_define_method(cTGGeometryIndex, "size", rb_tg_geometry_index_size, 0);
