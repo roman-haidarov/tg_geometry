@@ -1,7 +1,7 @@
 // https://github.com/tidwall/tg
 //
 // Copyright 2023 Joshua J Baker. All rights reserved.
-// Use of this source code is governed by a license 
+// Use of this source code is governed by a license
 // that can be found in the LICENSE file.
 
 #ifndef TG_H
@@ -26,7 +26,7 @@ struct tg_segment {
 };
 
 /// A rectangle defined by a minimum and maximum coordinates.
-/// Returned by the tg_geom_rect(), tg_ring_rect(), and other \*_rect() 
+/// Returned by the tg_geom_rect(), tg_ring_rect(), and other \*_rect()
 /// functions for getting a geometry's minimum bounding rectangle.
 /// Also used internally for geometry indexing.
 /// @see RectFuncs
@@ -62,10 +62,10 @@ enum tg_geom_type {
 /// Used for polygons, rings, and lines to make the point-in-polygon and
 /// geometry intersection operations fast.
 ///
-/// An index can also be used for efficiently traversing, searching, and 
-/// performing nearest-neighbor (kNN) queries on the segment using 
+/// An index can also be used for efficiently traversing, searching, and
+/// performing nearest-neighbor (kNN) queries on the segment using
 /// tg_ring_index_*() and tg_ring_nearest() functions.
-enum tg_index { 
+enum tg_index {
     TG_DEFAULT,  ///< default is TG_NATURAL or tg_env_set_default_index().
     TG_NONE,     ///< no indexing available, or disabled.
     TG_NATURAL,  ///< indexing with natural ring order, for rings/lines
@@ -73,7 +73,7 @@ enum tg_index {
 };
 
 /// @defgroup GeometryConstructors Geometry constructors
-/// Functions for creating and freeing geometries. 
+/// Functions for creating and freeing geometries.
 /// @{
 struct tg_geom *tg_geom_new_point(struct tg_point point);
 struct tg_geom *tg_geom_new_linestring(const struct tg_line *line);
@@ -110,6 +110,7 @@ const struct tg_poly *tg_geom_poly_at(const struct tg_geom *geom, int index);
 int tg_geom_num_geometries(const struct tg_geom *geom);
 const struct tg_geom *tg_geom_geometry_at(const struct tg_geom *geom, int index);
 const char *tg_geom_extra_json(const struct tg_geom *geom);
+const char *tg_geom_extra_json2(const struct tg_geom *geom, size_t *jsonlen);
 bool tg_geom_is_empty(const struct tg_geom *geom);
 int tg_geom_dims(const struct tg_geom *geom);
 bool tg_geom_has_z(const struct tg_geom *geom);
@@ -240,7 +241,7 @@ bool tg_rect_intersects_point(struct tg_rect a, struct tg_point b);
 /// Functions for working directly with the tg_ring type.
 ///
 /// There are no direct spatial predicates for tg_ring.
-/// If you want to perform operations like "intersects" or "covers" then you 
+/// If you want to perform operations like "intersects" or "covers" then you
 /// must upcast the ring to a tg_geom, like such:
 ///
 /// ```
@@ -265,17 +266,17 @@ int tg_ring_index_spread(const struct tg_ring *ring);
 int tg_ring_index_num_levels(const struct tg_ring *ring);
 int tg_ring_index_level_num_rects(const struct tg_ring *ring, int levelidx);
 struct tg_rect tg_ring_index_level_rect(const struct tg_ring *ring, int levelidx, int rectidx);
-bool tg_ring_nearest_segment(const struct tg_ring *ring, 
+bool tg_ring_nearest_segment(const struct tg_ring *ring,
     double (*rect_dist)(struct tg_rect rect, int *more, void *udata),
     double (*seg_dist)(struct tg_segment seg, int *more, void *udata),
     bool (*iter)(struct tg_segment seg, double dist, int index, void *udata),
     void *udata);
-void tg_ring_line_search(const struct tg_ring *a, const struct tg_line *b, 
-    bool (*iter)(struct tg_segment aseg, int aidx, struct tg_segment bseg, 
+void tg_ring_line_search(const struct tg_ring *a, const struct tg_line *b,
+    bool (*iter)(struct tg_segment aseg, int aidx, struct tg_segment bseg,
         int bidx, void *udata),
     void *udata);
-void tg_ring_ring_search(const struct tg_ring *a, const struct tg_ring *b, 
-    bool (*iter)(struct tg_segment aseg, int aidx, struct tg_segment bseg, 
+void tg_ring_ring_search(const struct tg_ring *a, const struct tg_ring *b,
+    bool (*iter)(struct tg_segment aseg, int aidx, struct tg_segment bseg,
         int bidx, void *udata),
     void *udata);
 double tg_ring_area(const struct tg_ring *ring);
@@ -286,7 +287,7 @@ double tg_ring_perimeter(const struct tg_ring *ring);
 /// Functions for working directly with the tg_line type.
 ///
 /// There are no direct spatial predicates for tg_line.
-/// If you want to perform operations like "intersects" or "covers" then you 
+/// If you want to perform operations like "intersects" or "covers" then you
 /// must upcast the line to a tg_geom, like such:
 ///
 /// ```
@@ -310,13 +311,13 @@ int tg_line_index_spread(const struct tg_line *line);
 int tg_line_index_num_levels(const struct tg_line *line);
 int tg_line_index_level_num_rects(const struct tg_line *line, int levelidx);
 struct tg_rect tg_line_index_level_rect(const struct tg_line *line, int levelidx, int rectidx);
-bool tg_line_nearest_segment(const struct tg_line *line, 
+bool tg_line_nearest_segment(const struct tg_line *line,
     double (*rect_dist)(struct tg_rect rect, int *more, void *udata),
     double (*seg_dist)(struct tg_segment seg, int *more, void *udata),
     bool (*iter)(struct tg_segment seg, double dist, int index, void *udata),
     void *udata);
-void tg_line_line_search(const struct tg_line *a, const struct tg_line *b, 
-    bool (*iter)(struct tg_segment aseg, int aidx, struct tg_segment bseg, 
+void tg_line_line_search(const struct tg_line *a, const struct tg_line *b,
+    bool (*iter)(struct tg_segment aseg, int aidx, struct tg_segment bseg,
         int bidx, void *udata),
     void *udata);
 double tg_line_length(const struct tg_line *line);
@@ -326,7 +327,7 @@ double tg_line_length(const struct tg_line *line);
 /// Functions for working directly with the tg_poly type.
 ///
 /// There are no direct spatial predicates for tg_poly.
-/// If you want to perform operations like "intersects" or "covers" then you 
+/// If you want to perform operations like "intersects" or "covers" then you
 /// must upcast the poly to a tg_geom, like such:
 ///
 /// ```

@@ -10,7 +10,7 @@
 #ifndef JSON_STATIC
 #include "json.h"
 #else
-enum json_type { 
+enum json_type {
     JSON_NULL,
     JSON_FALSE,
     JSON_NUMBER,
@@ -77,7 +77,7 @@ static inline int64_t vesc(const uint8_t *json, int64_t jlen, int64_t i) {
     i += 1;
     if (i == jlen) return -(i+1);
     switch (json[i]) {
-    case '"': case '\\': case '/': case 'b': case 'f': case 'n': 
+    case '"': case '\\': case '/': case 'b': case 'f': case 'n':
     case 'r': case 't': return i+1;
     case 'u':
         for (int j = 0; j < 4; j++) {
@@ -142,7 +142,7 @@ static int64_t vstring(const uint8_t *json, int64_t jlen, int64_t i) {
         } else {
             break;
         }
-    } 
+    }
     return -(i+1);
 }
 
@@ -154,7 +154,7 @@ static int64_t vnumber(const uint8_t *data, int64_t dlen, int64_t i) {
         if (i == dlen) return -(i+1);
         if (data[i] < '0' || data[i] > '9') return -(i+1);
     }
-    // int 
+    // int
     if (data[i] == '0') {
         i++;
     } else {
@@ -300,7 +300,7 @@ static int64_t vany(const uint8_t *data, int64_t dlen, int64_t i, int depth) {
         case 't': return vtrue(data, dlen, i+1);
         case 'f': return vfalse(data, dlen, i+1);
         case 'n': return vnull(data, dlen, i+1);
-        case '-': case '0': case '1': case '2': case '3': case '4': 
+        case '-': case '0': case '1': case '2': case '3': case '4':
         case '5': case '6': case '7': case '8': case '9':
             return vnumber(data, dlen, i+1);
         }
@@ -479,7 +479,7 @@ static struct json peek_any(uint8_t *raw, uint8_t *end) {
         case 'n': return take_literal(raw, end, 4);
         case 't': return take_literal(raw, end, 4);
         case 'f': return take_literal(raw, end, 5);
-        case '-': case '0': case '1': case '2': case '3': case '4': case '5': 
+        case '-': case '0': case '1': case '2': case '3': case '4': case '5':
         case '6': case '7': case '8': case '9': return take_number(raw, end);
         }
         raw++;
@@ -552,7 +552,7 @@ static int strcmpn(const char *a, size_t alen, const char *b, size_t blen) {
     return cmp;
 }
 
-static const uint8_t hextoks[256] = { 
+static const uint8_t hextoks[256] = {
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
     0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,2,3,4,5,6,7,8,9,0,0,0,0,0,0,
     0,10,11,12,13,14,15,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
@@ -565,12 +565,12 @@ static uint32_t decode_hex(const uint8_t *str) {
 }
 
 static bool is_surrogate(uint32_t cp) {
-    return cp > 55296 && cp < 57344;
+    return cp >= 55296 && cp < 57344;
 }
 
 static uint32_t decode_codepoint(uint32_t cp1, uint32_t cp2) {
-    return cp1 > 55296  && cp1 < 56320 && cp2 > 56320 && cp2 < 57344 ?
-        ((cp1 - 55296) << 10) | ((cp2 - 56320) + 65536) :
+    return cp1 >= 55296 && cp1 < 56320 && cp2 >= 56320 && cp2 < 57344 ?
+        ((cp1 - 55296) << 10) + (cp2 - 56320) + 65536 :
         65533;
 }
 
@@ -599,7 +599,7 @@ static inline int encode_codepoint(uint8_t dst[], uint32_t cp) {
 }
 
 // for_each_utf8 iterates over each UTF-8 bytes in jstr, unescaping along the
-// way. 'f' is a loop expression that will make available the 'ch' char which 
+// way. 'f' is a loop expression that will make available the 'ch' char which
 // is just a single byte in a UTF-8 series.
 #define for_each_utf8(jstr, len, f) { \
     size_t nn = (len); \
@@ -647,7 +647,7 @@ static inline int encode_codepoint(uint8_t dst[], uint32_t cp) {
     } \
 }
 
-JSON_EXTERN 
+JSON_EXTERN
 int json_raw_comparen(struct json json, const char *str, size_t len) {
     char *raw = (char*)jraw(json);
     if (!raw) raw = "";
@@ -674,7 +674,7 @@ JSON_EXTERN size_t json_string_length(struct json json) {
     return count;
 }
 
-JSON_EXTERN 
+JSON_EXTERN
 int json_string_comparen(struct json json, const char *str, size_t slen) {
     if (json_type(json) != JSON_STRING) {
         return json_raw_comparen(json, str, slen);
@@ -703,7 +703,7 @@ done:
     return cmp;
 }
 
-JSON_EXTERN 
+JSON_EXTERN
 int json_string_compare(struct json json, const char *str) {
     return json_string_comparen(json, str, str?strlen(str):0);
 }
@@ -893,7 +893,7 @@ JSON_EXTERN bool json_bool(struct json json) {
     case JSON_TRUE:
         return true;
     case JSON_NUMBER:
-         return json_double(json) != 0.0; 
+         return json_double(json) != 0.0;
     case JSON_STRING: {
         char *trues[] = { "1", "t", "T", "true", "TRUE", "True" };
         for (size_t i = 0; i < sizeof(trues)/sizeof(char*); i++) {
@@ -906,16 +906,16 @@ JSON_EXTERN bool json_bool(struct json json) {
     }
 }
 
-struct jesc_buf { 
+struct jesc_buf {
     uint8_t *esc;
     size_t esclen;
     size_t count;
 };
 
 static void jesc_append(struct jesc_buf *buf, uint8_t ch) {
-    if (buf->esclen > 1) { 
+    if (buf->esclen > 1) {
         *(buf->esc++) = ch;
-        buf->esclen--; 
+        buf->esclen--;
     }
     buf->count++;
 }
@@ -926,7 +926,7 @@ static void jesc_append2(struct jesc_buf *buf, uint8_t c1, uint8_t c2) {
 
 static const uint8_t hexchars[] = "0123456789abcdef";
 
-static void 
+static void
 jesc_append_ux(struct jesc_buf *buf, uint8_t c1, uint8_t c2, uint16_t x) {
     jesc_append2(buf, c1, c2);
     jesc_append2(buf, hexchars[x>>12&0xF], hexchars[x>>8&0xF]);
@@ -1008,7 +1008,7 @@ struct json json_getn(const char *json_str, size_t len, const char *path) {
             if (*end && *end != '.') { i = 0; break; }
             json = json_array_get(json, index);
         } else {
-            i = 0; 
+            i = 0;
             break;
         }
     }

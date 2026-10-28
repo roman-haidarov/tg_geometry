@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.3 - 28.10.2026
+
+### Changed
+
+- Updated vendored `tidwall/tg`, `rtree.c` to v0.6.1, and `json.c` to pinned upstream revisions.
+- Vendor sync now removes trailing whitespace from C sources and headers.
+
+### Fixed
+
+- Avoided querying TG parse errors when geometry allocation fails in FeatureSource.
+- Corrected JSON UTF-16 surrogate boundary handling through the updated `json.c` vendor.
+
 ## 0.3.2 - unreleased
 
 ### Added

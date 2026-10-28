@@ -1,3 +1,3 @@
 repo=https://github.com/tidwall/rtree.c.git
-ref=v0.5.3
-commit=5717a8a1eb373428ebaae8c1c623f186ec46461f
+ref=v0.6.1
+commit=eebc774929f89fd5f4095f7c8835a87f2d2fb73f

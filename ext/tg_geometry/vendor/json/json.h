@@ -10,7 +10,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-enum json_type { 
+enum json_type {
     JSON_NULL,
     JSON_FALSE,
     JSON_NUMBER,
@@ -39,7 +39,7 @@ struct json_valid json_validn_ex(const char *json_str, size_t len, int opts);
 // Invalid json is safe and will not cause program errors, but it may return
 // unexpected results. If you are consuming JSON from an unpredictable source
 // then you may want to use the 'json_valid' function first.
-// 
+//
 // It's important to note that the resulting 'struct json' is backed by the
 // same memory as json_str, thus a 'struct json' cannot outlive the original
 // json_str. Attempting to use  any of the json_*(struct json...) functions on
@@ -55,19 +55,19 @@ struct json json_parsen(const char *json_str, size_t len);
 // object or array, then a non-existent json value is returned.
 struct json json_first(struct json json);
 
-// json_next returns the json's next child. 
+// json_next returns the json's next child.
 //
-// This typically follows a 'json_first' call, and is used to iterate over the 
+// This typically follows a 'json_first' call, and is used to iterate over the
 // children in an object or array. For arrays, each 'json_next' call will
 // return a the next value. For objects, each 'json_next' call alternates over
 // value, key, value  key, value, etc. If there are no more children, then a
 // non-existent json value is returned.
 struct json json_next(struct json json);
 
-// json_exists checks for the existence of json. 
+// json_exists checks for the existence of json.
 bool json_exists(struct json json);
 
-// json_type returns the json's type. 
+// json_type returns the json's type.
 //
 // Returns one of the following: JSON_NULL, JSON_STRING, JSON_NUMBER,
 // JSON_TRUE, JSON_FALSE, JSON_OBJECT, JSON_ARRAY.
@@ -75,12 +75,12 @@ bool json_exists(struct json json);
 enum json_type json_type(struct json json);
 
 // json_raw returns the start of the raw json data.
-// 
+//
 // This function may return NULL if the input is non-existent. Also there is
-// no guarentee that this data will be null-terminated C string. If you want to
+// no guarantee that this data will be null-terminated C string. If you want to
 // retain this data for longer that the data from the original 'json_parse'
 // call then you should copy it first, such as:
-// 
+//
 //    size_t len = json_raw_length(json);
 //    char *raw = malloc(len+1);
 //    memcpy(raw, json_raw(json), len);
@@ -108,12 +108,12 @@ int json_raw_comparen(struct json json, const char *str, size_t len);
 // other, it continues until the characters differ or until the end of the JSON
 // or a terminating null-character in the C string is reached.
 //
-// If the JSON type is JSON_STRING, then each character that needs to be 
+// If the JSON type is JSON_STRING, then each character that needs to be
 // unescaped is done so in a streaming manner. ie. without the additional
 // buffering or memory allocations. Of those characters, the ones that are
 // non-ascii codepoints are encoded into their UTF-8 representation, of which
 // those bytes are then compared to the C string.
-// 
+//
 // If the JSON type is not a JSON_STRING, then it performs a binary comparison
 // of the raw JSON to the C string.
 int json_string_compare(struct json json, const char *str);
@@ -131,9 +131,9 @@ bool json_string_is_escaped(struct json json);
 //
 // Returns the number of characters, not including the null-terminator, needed
 // to store the JSON into the C string buffer.
-// If the returned length is greater than nbytes-1, then only a parital copy
+// If the returned length is greater than nbytes-1, then only a partial copy
 // occurred, for example:
-//    
+//
 //    char buf[64];
 //    size_t len = json_string_copy(json, str, sizeof(str));
 //    if (len > sizeof(str)-1) {
@@ -167,8 +167,8 @@ struct json json_object_getn(struct json json, const char *key, size_t len);
 // json_array_get functions.
 //
 //    json_str = "{\"notes\": {\"special.info\": \"it's nice outside\"}";
-//    json = json_parse(json_str); 
-//    json = json_object_get(json, "notes"); 
+//    json = json_parse(json_str);
+//    json = json_object_get(json, "notes");
 //    json = json_object_get(json, "special.info");
 //
 struct json json_get(const char *json_str, const char *path);
@@ -190,14 +190,14 @@ uint64_t json_uint64(struct json json);
 bool json_bool(struct json json);
 
 // json_escape is a utility function for converting a C string into a valid
-// json string. 
+// json string.
 //
 // Returns the number of characters, not including the null-terminator, needed
 // to store the escaped JSON string in the C string buffer.
-// If the returned length is greater than n-1, then only a parital copy
-// occurred. In other words the 
-size_t json_escape(const char *str, char *escaped, size_t n); 
-size_t json_escapen(const char *str, size_t len, char *escaped, size_t n); 
+// If the returned length is greater than n-1, then only a partial copy
+// occurred. In other words the
+size_t json_escape(const char *str, char *escaped, size_t n);
+size_t json_escapen(const char *str, size_t len, char *escaped, size_t n);
 
 // json_ensure ensures that the json value has been entirely scanned.
 // Only useful for when you need to call json_raw_length on large objects and
