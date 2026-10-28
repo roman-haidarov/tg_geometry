@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.4 - 28.10.2026
+
+### Changed
+
+- Split the complex geometry traversal, index construction, FeatureSource preparation and file-read paths into focused helpers. The public API and runtime behavior are unchanged.
+- Split native extension initialization into registration helpers without changing registration order.
+
 ## 0.3.3 - 28.10.2026
 
 ### Changed
