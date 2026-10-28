@@ -3222,9 +3222,46 @@ static bool tg_distance_accum_poly(tg_distance_accum_t *accum, const struct tg_p
     return true;
 }
 
-static bool tg_distance_accum_geom(tg_distance_accum_t *accum, const struct tg_geom *geom) {
-    int count;
+static bool tg_distance_accum_geom(tg_distance_accum_t *accum, const struct tg_geom *geom);
 
+static void tg_distance_accum_multipoint(tg_distance_accum_t *accum,
+                                         const struct tg_geom *geom) {
+    int count = tg_geom_num_points(geom);
+    for (int i = 0; i < count; i++)
+        tg_distance_accum_point(accum, tg_geom_point_at(geom, i));
+}
+
+static bool tg_distance_accum_multiline(tg_distance_accum_t *accum,
+                                        const struct tg_geom *geom) {
+    int count = tg_geom_num_lines(geom);
+    for (int i = 0; i < count; i++) {
+        if (!tg_distance_accum_line(accum, tg_geom_line_at(geom, i)))
+            return false;
+    }
+    return true;
+}
+
+static bool tg_distance_accum_multipoly(tg_distance_accum_t *accum,
+                                        const struct tg_geom *geom) {
+    int count = tg_geom_num_polys(geom);
+    for (int i = 0; i < count; i++) {
+        if (!tg_distance_accum_poly(accum, tg_geom_poly_at(geom, i)))
+            return false;
+    }
+    return true;
+}
+
+static bool tg_distance_accum_collection(tg_distance_accum_t *accum,
+                                        const struct tg_geom *geom) {
+    int count = tg_geom_num_geometries(geom);
+    for (int i = 0; i < count; i++) {
+        if (!tg_distance_accum_geom(accum, tg_geom_geometry_at(geom, i)))
+            return false;
+    }
+    return true;
+}
+
+static bool tg_distance_accum_geom(tg_distance_accum_t *accum, const struct tg_geom *geom) {
     if (!geom || tg_geom_is_empty(geom)) {
         return true;
     }
@@ -3234,39 +3271,18 @@ static bool tg_distance_accum_geom(tg_distance_accum_t *accum, const struct tg_g
         tg_distance_accum_point(accum, tg_geom_point(geom));
         return true;
     case TG_MULTIPOINT:
-        count = tg_geom_num_points(geom);
-        for (int i = 0; i < count; i++) {
-            tg_distance_accum_point(accum, tg_geom_point_at(geom, i));
-        }
+        tg_distance_accum_multipoint(accum, geom);
         return true;
     case TG_LINESTRING:
         return tg_distance_accum_line(accum, tg_geom_line(geom));
     case TG_MULTILINESTRING:
-        count = tg_geom_num_lines(geom);
-        for (int i = 0; i < count; i++) {
-            if (!tg_distance_accum_line(accum, tg_geom_line_at(geom, i))) {
-                return false;
-            }
-        }
-        return true;
+        return tg_distance_accum_multiline(accum, geom);
     case TG_POLYGON:
         return tg_distance_accum_poly(accum, tg_geom_poly(geom));
     case TG_MULTIPOLYGON:
-        count = tg_geom_num_polys(geom);
-        for (int i = 0; i < count; i++) {
-            if (!tg_distance_accum_poly(accum, tg_geom_poly_at(geom, i))) {
-                return false;
-            }
-        }
-        return true;
+        return tg_distance_accum_multipoly(accum, geom);
     case TG_GEOMETRYCOLLECTION:
-        count = tg_geom_num_geometries(geom);
-        for (int i = 0; i < count; i++) {
-            if (!tg_distance_accum_geom(accum, tg_geom_geometry_at(geom, i))) {
-                return false;
-            }
-        }
-        return true;
+        return tg_distance_accum_collection(accum, geom);
     }
 
     return true;
@@ -4412,6 +4428,14 @@ typedef struct {
     enum tg_index geometry_index;
 } tg_index_build_args_t;
 
+typedef struct {
+    VALUE entries;
+    enum tg_geometry_index_via via;
+    enum tg_geometry_index_strategy strategy;
+    enum tg_geometry_index_predicate predicate;
+    enum tg_index geometry_index;
+} tg_index_build_options_t;
+
 static void index_expand_bbox(tg_index_t *idx, struct tg_rect bbox) {
     if (!idx->has_bbox) {
         idx->bbox = bbox;
@@ -4586,30 +4610,20 @@ static VALUE index_build_body(VALUE arg) {
     return Qnil;
 }
 
-static VALUE rb_tg_geometry_index_build(int argc, VALUE *argv, VALUE klass) {
-    VALUE entries_value;
+static void parse_index_build_options(int argc, VALUE *argv, tg_index_build_options_t *options) {
     VALUE kwargs;
     VALUE via_value;
     VALUE strategy_value;
     VALUE predicate_value;
     VALUE geometry_index_value;
-    enum tg_geometry_index_via via;
-    enum tg_geometry_index_strategy strategy;
-    enum tg_geometry_index_predicate predicate;
-    enum tg_index geometry_index;
-    long len;
-    tg_index_t *idx;
-    VALUE wrapper;
-    tg_index_build_args_t args;
-    int state = 0;
 
-    rb_scan_args(argc, argv, "1:", &entries_value, &kwargs);
+    rb_scan_args(argc, argv, "1:", &options->entries, &kwargs);
     {
         ID allowed[] = {id_via, id_strategy, id_predicate, id_geometry_index};
         validate_keywords(kwargs, allowed, sizeof(allowed) / sizeof(allowed[0]));
     }
 
-    if (!RB_TYPE_P(entries_value, T_ARRAY)) {
+    if (!RB_TYPE_P(options->entries, T_ARRAY)) {
         rb_raise(rb_eTypeError, "entries must be Array");
     }
 
@@ -4618,18 +4632,23 @@ static VALUE rb_tg_geometry_index_build(int argc, VALUE *argv, VALUE klass) {
     predicate_value = kwargs_value(kwargs, id_predicate, ID2SYM(id_covers));
     geometry_index_value = kwargs_value(kwargs, id_geometry_index, ID2SYM(id_ystripes));
 
-    via = parse_index_via_symbol(via_value);
-    strategy = parse_index_strategy_symbol(strategy_value);
-    predicate = parse_index_predicate_symbol(predicate_value);
-    geometry_index = parse_index_symbol(geometry_index_value);
+    options->via = parse_index_via_symbol(via_value);
+    options->strategy = parse_index_strategy_symbol(strategy_value);
+    options->predicate = parse_index_predicate_symbol(predicate_value);
+    options->geometry_index = parse_index_symbol(geometry_index_value);
+}
 
-    len = RARRAY_LEN(entries_value);
-    wrapper = TypedData_Make_Struct(klass, tg_index_t, &tg_index_type, idx);
+static VALUE allocate_index_wrapper(VALUE klass, const tg_index_build_options_t *options,
+                                    tg_index_t **idx_out) {
+    long len = RARRAY_LEN(options->entries);
+    tg_index_t *idx;
+    VALUE wrapper = TypedData_Make_Struct(klass, tg_index_t, &tg_index_type, idx);
+
     idx->len = len;
     idx->capacity = len;
     idx->initialized = 0;
-    idx->strategy = strategy;
-    idx->predicate = predicate;
+    idx->strategy = options->strategy;
+    idx->predicate = options->predicate;
     idx->rtree = NULL;
     idx->frozen = false;
     idx->has_bbox = false;
@@ -4654,17 +4673,29 @@ static VALUE rb_tg_geometry_index_build(int argc, VALUE *argv, VALUE klass) {
         idx->entries_bytes = (size_t)len * sizeof(tg_index_entry_t);
         rb_gc_adjust_memory_usage((ssize_t)idx->entries_bytes);
     }
+    *idx_out = idx;
+    return wrapper;
+}
 
+static VALUE rb_tg_geometry_index_build(int argc, VALUE *argv, VALUE klass) {
+    tg_index_build_options_t options;
+    tg_index_build_args_t args;
+    tg_index_t *idx;
+    VALUE wrapper;
+    int state = 0;
+
+    parse_index_build_options(argc, argv, &options);
+    wrapper = allocate_index_wrapper(klass, &options, &idx);
     args.idx = idx;
-    args.entries = entries_value;
-    args.via = via;
-    args.geometry_index = geometry_index;
+    args.entries = options.entries;
+    args.via = options.via;
+    args.geometry_index = options.geometry_index;
 
     rb_protect(index_build_body, (VALUE)&args, &state);
 
     if (state) {
         index_dispose(idx);
-        RB_GC_GUARD(entries_value);
+        RB_GC_GUARD(options.entries);
         RB_GC_GUARD(wrapper);
         rb_jump_tag(state);
     }
@@ -4677,7 +4708,7 @@ static VALUE rb_tg_geometry_index_build(int argc, VALUE *argv, VALUE klass) {
     idx->frozen = true;
     rb_obj_freeze(wrapper);
 
-    RB_GC_GUARD(entries_value);
+    RB_GC_GUARD(options.entries);
     RB_GC_GUARD(wrapper);
     return wrapper;
 }
@@ -5474,26 +5505,15 @@ static bool fs_extract_id(fs_source_t *source, fs_options_t *opts, struct json f
     return true;
 }
 
-static bool fs_feature_prepare(fs_source_t *source, fs_options_t *opts, fs_mode_t mode,
-                               struct json feature, long feature_index, bool materialize_id,
-                               fs_feature_result_t *result) {
+static bool fs_feature_geometry_info(struct json feature, fs_feature_result_t *result,
+                                     struct json *geometry_out, unsigned int *geom_bit_out) {
     struct json geometry;
     struct json geometry_type;
-    struct json properties;
-    unsigned int geom_bit;
-    VALUE id = Qnil;
-    VALUE error_message = Qnil;
-
-    memset(result, 0, sizeof(*result));
-    result->feature = feature;
-    result->id = Qnil;
-    result->reason_value = Qnil;
 
     if (!json_exists(feature) || json_type(feature) != JSON_OBJECT) {
         result->reason = "feature is not an object";
         return false;
     }
-
     geometry = json_object_get(feature, "geometry");
     if (!json_exists(geometry) || json_type(geometry) == JSON_NULL) {
         result->reason = "missing geometry";
@@ -5510,11 +5530,49 @@ static bool fs_feature_prepare(fs_source_t *source, fs_options_t *opts, fs_mode_
         return false;
     }
 
-    geom_bit = fs_geometry_type_bit(geometry_type);
-    if (geom_bit == 0) {
+    *geom_bit_out = fs_geometry_type_bit(geometry_type);
+    if (*geom_bit_out == 0) {
         result->reason = "unsupported geometry.type";
         return false;
     }
+
+    *geometry_out = geometry;
+    return true;
+}
+
+static bool fs_feature_prepare_properties(fs_mode_t mode, struct json feature,
+                                          fs_feature_result_t *result) {
+    struct json properties;
+
+    if (mode != FS_MODE_READ_FEATURES)
+        return true;
+
+    properties = json_object_get(feature, "properties");
+    if (json_exists(properties) && json_type(properties) != JSON_NULL &&
+        json_type(properties) != JSON_OBJECT) {
+        result->reason = "properties must be an object or null";
+        return false;
+    }
+
+    result->properties = properties;
+    return true;
+}
+
+static bool fs_feature_prepare(fs_source_t *source, fs_options_t *opts, fs_mode_t mode,
+                               struct json feature, long feature_index, bool materialize_id,
+                               fs_feature_result_t *result) {
+    struct json geometry;
+    unsigned int geom_bit;
+    VALUE id = Qnil;
+    VALUE error_message = Qnil;
+
+    memset(result, 0, sizeof(*result));
+    result->feature = feature;
+    result->id = Qnil;
+    result->reason_value = Qnil;
+
+    if (!fs_feature_geometry_info(feature, result, &geometry, &geom_bit))
+        return false;
 
     if (!opts->only_all && (opts->only_mask & geom_bit) == 0) {
         result->filtered = true;
@@ -5527,16 +5585,8 @@ static bool fs_feature_prepare(fs_source_t *source, fs_options_t *opts, fs_mode_
         return false;
     }
 
-    if (mode == FS_MODE_READ_FEATURES) {
-        properties = json_object_get(feature, "properties");
-        if (!json_exists(properties) || json_type(properties) == JSON_NULL) {
-            /* returned as "null" */
-        } else if (json_type(properties) != JSON_OBJECT) {
-            result->reason = "properties must be an object or null";
-            return false;
-        }
-        result->properties = properties;
-    }
+    if (!fs_feature_prepare_properties(mode, feature, result))
+        return false;
 
     result->accepted = true;
     result->id = id;
@@ -5964,21 +6014,16 @@ typedef struct {
     const char *reason;
 } fs_safe_feature_t;
 
-static bool fs_safe_prepare_feature(fs_safe_job_t *job, struct json feature, long feature_index,
-                                    fs_mode_t mode, fs_safe_feature_t *out) {
+static bool fs_safe_feature_geometry_info(struct json feature, fs_safe_feature_t *out,
+                                          struct json *geometry_out,
+                                          unsigned int *geom_bit_out) {
     struct json geometry;
     struct json geometry_type;
-    struct json properties;
-    unsigned int geom_bit;
-
-    memset(out, 0, sizeof(*out));
-    out->feature = feature;
 
     if (!json_exists(feature) || json_type(feature) != JSON_OBJECT) {
         out->reason = "feature is not an object";
         return false;
     }
-
     geometry = json_object_get(feature, "geometry");
     if (!json_exists(geometry) || json_type(geometry) == JSON_NULL) {
         out->reason = "missing geometry";
@@ -5995,11 +6040,45 @@ static bool fs_safe_prepare_feature(fs_safe_job_t *job, struct json feature, lon
         return false;
     }
 
-    geom_bit = fs_safe_geometry_type_bit(geometry_type);
-    if (geom_bit == 0) {
+    *geom_bit_out = fs_safe_geometry_type_bit(geometry_type);
+    if (*geom_bit_out == 0) {
         out->reason = "unsupported geometry.type";
         return false;
     }
+
+    *geometry_out = geometry;
+    return true;
+}
+
+static bool fs_safe_feature_properties(fs_mode_t mode, struct json feature,
+                                       fs_safe_feature_t *out) {
+    struct json properties;
+
+    if (mode != FS_MODE_READ_FEATURES)
+        return true;
+
+    properties = json_object_get(feature, "properties");
+    if (!json_exists(properties) || json_type(properties) == JSON_NULL) {
+        out->properties_null = true;
+    } else if (json_type(properties) != JSON_OBJECT) {
+        out->reason = "properties must be an object or null";
+        return false;
+    } else {
+        out->properties = properties;
+    }
+    return true;
+}
+
+static bool fs_safe_prepare_feature(fs_safe_job_t *job, struct json feature, long feature_index,
+                                    fs_mode_t mode, fs_safe_feature_t *out) {
+    struct json geometry;
+    unsigned int geom_bit;
+
+    memset(out, 0, sizeof(*out));
+    out->feature = feature;
+
+    if (!fs_safe_feature_geometry_info(feature, out, &geometry, &geom_bit))
+        return false;
 
     if (!job->opts.only_all && (job->opts.only_mask & geom_bit) == 0) {
         out->filtered = true;
@@ -6011,17 +6090,8 @@ static bool fs_safe_prepare_feature(fs_safe_job_t *job, struct json feature, lon
         return false;
     }
 
-    if (mode == FS_MODE_READ_FEATURES) {
-        properties = json_object_get(feature, "properties");
-        if (!json_exists(properties) || json_type(properties) == JSON_NULL) {
-            out->properties_null = true;
-        } else if (json_type(properties) != JSON_OBJECT) {
-            out->reason = "properties must be an object or null";
-            return false;
-        } else {
-            out->properties = properties;
-        }
-    }
+    if (!fs_safe_feature_properties(mode, feature, out))
+        return false;
 
     out->accepted = true;
     out->geometry = geometry;
@@ -6275,78 +6345,87 @@ static bool fs_safe_fill_build(fs_safe_job_t *job, struct json features) {
     return true;
 }
 
-static bool fs_safe_read_file_no_gvl(fs_safe_job_t *job) {
-    int fd;
+static bool fs_safe_allocate_read_buffer(fs_safe_job_t *job, int fd, char **buf_out,
+                                         size_t *cap_out) {
     struct stat st;
-    char *buf = NULL;
     size_t cap = 0;
-    size_t len = 0;
-
-    fd = open(job->path, O_RDONLY);
-    if (fd < 0) {
-        fs_safe_set_system_error(job, errno);
-        return false;
-    }
 
     if (fstat(fd, &st) == 0 && st.st_size >= 0) {
         cap = (size_t)st.st_size;
         if (cap > SIZE_MAX - 1) {
-            close(fd);
             fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource file is too large");
-            return false;
-        }
-        buf = (char *)malloc(cap + 1);
-        if (!buf) {
-            close(fd);
-            fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource file allocation failed");
             return false;
         }
     } else {
         cap = 8192;
-        buf = (char *)malloc(cap + 1);
-        if (!buf) {
-            close(fd);
-            fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource file allocation failed");
-            return false;
-        }
     }
 
+    *buf_out = (char *)malloc(cap + 1);
+    if (!*buf_out) {
+        fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource file allocation failed");
+        return false;
+    }
+    *cap_out = cap;
+    return true;
+}
+
+static bool fs_safe_grow_read_buffer(fs_safe_job_t *job, char **buf, size_t *cap) {
+    size_t new_cap = *cap < 8192 ? 8192 : *cap * 2;
+    char *grown;
+
+    if (new_cap < *cap || new_cap > SIZE_MAX - 1) {
+        fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource file allocation overflow");
+        return false;
+    }
+    grown = (char *)realloc(*buf, new_cap + 1);
+    if (!grown) {
+        fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource file allocation failed");
+        return false;
+    }
+    *buf = grown;
+    *cap = new_cap;
+    return true;
+}
+
+static bool fs_safe_read_file_contents(fs_safe_job_t *job, int fd, char **buf, size_t *cap,
+                                       size_t *len) {
     for (;;) {
         ssize_t n;
-        if (len == cap) {
-            size_t new_cap = cap < 8192 ? 8192 : cap * 2;
-            char *grown;
-            if (new_cap < cap || new_cap > SIZE_MAX - 1) {
-                free(buf);
-                close(fd);
-                fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM,
-                                  "FeatureSource file allocation overflow");
+        if (*len == *cap) {
+            if (!fs_safe_grow_read_buffer(job, buf, cap))
                 return false;
-            }
-            grown = (char *)realloc(buf, new_cap + 1);
-            if (!grown) {
-                free(buf);
-                close(fd);
-                fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "FeatureSource file allocation failed");
-                return false;
-            }
-            buf = grown;
-            cap = new_cap;
         }
 
-        n = read(fd, buf + len, cap - len);
+        n = read(fd, *buf + *len, *cap - *len);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
-            int err = errno;
-            free(buf);
-            close(fd);
-            fs_safe_set_system_error(job, err);
+            fs_safe_set_system_error(job, errno);
             return false;
         }
         if (n == 0)
             break;
-        len += (size_t)n;
+        *len += (size_t)n;
+    }
+
+    return true;
+}
+
+static bool fs_safe_read_file_no_gvl(fs_safe_job_t *job) {
+    int fd = open(job->path, O_RDONLY);
+    char *buf = NULL;
+    size_t cap = 0;
+    size_t len = 0;
+
+    if (fd < 0) {
+        fs_safe_set_system_error(job, errno);
+        return false;
+    }
+    if (!fs_safe_allocate_read_buffer(job, fd, &buf, &cap) ||
+        !fs_safe_read_file_contents(job, fd, &buf, &cap, &len)) {
+        free(buf);
+        close(fd);
+        return false;
     }
 
     if (close(fd) != 0) {
@@ -7122,9 +7201,7 @@ static VALUE rb_tg_feature_source_build_index_io(int argc, VALUE *argv, VALUE se
     return fs_safe_dispatch_json(json_string, kwargs, FS_MODE_BUILD_INDEX);
 }
 
-RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
-    tg_geometry_vendor_header_sanity();
-
+static void tg_geometry_init_ids(void) {
     id_format = rb_intern("format");
     id_index = rb_intern("index");
     id_srid = rb_intern("srid");
@@ -7167,7 +7244,9 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     id_exterior = rb_intern("exterior");
     id_holes = rb_intern("holes");
     id_sort = rb_intern("sort");
+}
 
+static void tg_geometry_init_core(void) {
     mTG = rb_define_module("TG");
     mTGGeometry = rb_define_module_under(mTG, "Geometry");
 
@@ -7200,7 +7279,9 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_singleton_method(mTGGeometry, "line_string", rb_tg_geometry_line_string, -1);
     rb_define_singleton_method(mTGGeometry, "polygon", rb_tg_geometry_polygon, -1);
     rb_define_singleton_method(mTGGeometry, "multi_polygon", rb_tg_geometry_multi_polygon, -1);
+}
 
+static void tg_geometry_init_geom(void) {
     cTGGeometryGeom = rb_define_class_under(mTGGeometry, "Geom", rb_cObject);
     rb_undef_alloc_func(cTGGeometryGeom);
     rb_define_method(cTGGeometryGeom, "type", rb_tg_geometry_geom_type, 0);
@@ -7260,7 +7341,9 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometryGeom, "num_geometries", rb_tg_geometry_geom_num_geometries, 0);
     rb_define_method(cTGGeometryGeom, "geometry_at", rb_tg_geometry_geom_geometry_at, 1);
     rb_define_method(cTGGeometryGeom, "geometries", rb_tg_geometry_geom_geometries, 0);
+}
 
+static void tg_geometry_init_line(void) {
     cTGGeometryLine = rb_define_class_under(mTGGeometry, "Line", rb_cObject);
     rb_undef_alloc_func(cTGGeometryLine);
     rb_define_method(cTGGeometryLine, "bbox", rb_tg_geometry_line_bbox, 0);
@@ -7273,7 +7356,9 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometryLine, "length", rb_tg_geometry_line_length, 0);
     rb_define_method(cTGGeometryLine, "clockwise?", rb_tg_geometry_line_clockwise_p, 0);
     rb_define_method(cTGGeometryLine, "nearest_segment", rb_tg_geometry_line_nearest_segment, 2);
+}
 
+static void tg_geometry_init_ring(void) {
     cTGGeometryRing = rb_define_class_under(mTGGeometry, "Ring", rb_cObject);
     rb_undef_alloc_func(cTGGeometryRing);
     rb_define_method(cTGGeometryRing, "bbox", rb_tg_geometry_ring_bbox, 0);
@@ -7288,7 +7373,9 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometryRing, "clockwise?", rb_tg_geometry_ring_clockwise_p, 0);
     rb_define_method(cTGGeometryRing, "convex?", rb_tg_geometry_ring_convex_p, 0);
     rb_define_method(cTGGeometryRing, "nearest_segment", rb_tg_geometry_ring_nearest_segment, 2);
+}
 
+static void tg_geometry_init_polygon(void) {
     cTGGeometryPolygon = rb_define_class_under(mTGGeometry, "Polygon", rb_cObject);
     rb_undef_alloc_func(cTGGeometryPolygon);
     rb_define_method(cTGGeometryPolygon, "bbox", rb_tg_geometry_polygon_bbox, 0);
@@ -7297,7 +7384,9 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometryPolygon, "hole_at", rb_tg_geometry_polygon_hole_at, 1);
     rb_define_method(cTGGeometryPolygon, "holes", rb_tg_geometry_polygon_holes, 0);
     rb_define_method(cTGGeometryPolygon, "clockwise?", rb_tg_geometry_polygon_clockwise_p, 0);
+}
 
+static void tg_geometry_init_segment(void) {
     cTGGeometrySegment = rb_define_class_under(mTGGeometry, "Segment", rb_cObject);
     rb_undef_alloc_func(cTGGeometrySegment);
     rb_define_method(cTGGeometrySegment, "a", rb_tg_geometry_segment_a, 0);
@@ -7305,7 +7394,9 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometrySegment, "points", rb_tg_geometry_segment_points, 0);
     rb_define_method(cTGGeometrySegment, "bbox", rb_tg_geometry_segment_bbox, 0);
     rb_define_method(cTGGeometrySegment, "intersects?", rb_tg_geometry_segment_intersects_p, 1);
+}
 
+static void tg_geometry_init_nearest(void) {
     cTGGeometryNearestSegment = rb_define_class_under(mTGGeometry, "NearestSegment", rb_cObject);
     rb_undef_alloc_func(cTGGeometryNearestSegment);
     rb_define_method(cTGGeometryNearestSegment, "segment", rb_tg_geometry_nearest_segment_segment,
@@ -7314,7 +7405,9 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometryNearestSegment, "distance", rb_tg_geometry_nearest_segment_distance,
                      0);
     rb_define_method(cTGGeometryNearestSegment, "point", rb_tg_geometry_nearest_segment_point, 0);
+}
 
+static void tg_geometry_init_rect(void) {
     cTGGeometryRect = rb_define_class_under(mTGGeometry, "Rect", rb_cObject);
     rb_define_alloc_func(cTGGeometryRect, rb_tg_geometry_rect_alloc);
     rb_define_method(cTGGeometryRect, "initialize", rb_tg_geometry_rect_initialize, -1);
@@ -7329,7 +7422,9 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
                      1);
     rb_define_method(cTGGeometryRect, "expand_to_include_point",
                      rb_tg_geometry_rect_expand_to_include_point, 2);
+}
 
+static void tg_geometry_init_feature_source(void) {
     mTGGeometryFeatureSource = rb_define_module_under(mTGGeometry, "FeatureSource");
     rb_define_singleton_method(mTGGeometryFeatureSource, "read_entries_file",
                                rb_tg_feature_source_read_entries_file, -1);
@@ -7349,7 +7444,9 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
                                rb_tg_feature_source_build_index_json, -1);
     rb_define_singleton_method(mTGGeometryFeatureSource, "build_index_io",
                                rb_tg_feature_source_build_index_io, -1);
+}
 
+static void tg_geometry_init_index(void) {
     cTGGeometryIndex = rb_define_class_under(mTGGeometry, "Index", rb_cObject);
     rb_undef_alloc_func(cTGGeometryIndex);
     rb_define_singleton_method(cTGGeometryIndex, "build", rb_tg_geometry_index_build, -1);
@@ -7377,7 +7474,9 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometryIndex, "strategy", rb_tg_geometry_index_strategy, 0);
     rb_define_method(cTGGeometryIndex, "predicate", rb_tg_geometry_index_predicate, 0);
     rb_define_method(cTGGeometryIndex, "bbox", rb_tg_geometry_index_bbox, 0);
+}
 
+static void tg_geometry_init_debug(void) {
 #ifdef TG_DEBUG_TEST
     rb_define_singleton_method(mTGGeometry, "_debug_reset_test_hooks!",
                                rb_tg_geometry_debug_reset_test_hooks, 0);
@@ -7400,4 +7499,20 @@ RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
     rb_define_method(cTGGeometryIndex, "_force_dispose_for_test!",
                      rb_tg_geometry_index_force_dispose_for_test, 0);
 #endif
+}
+
+RUBY_FUNC_EXPORTED void Init_tg_geometry_ext_geometry_ext(void) {
+    tg_geometry_vendor_header_sanity();
+    tg_geometry_init_ids();
+    tg_geometry_init_core();
+    tg_geometry_init_geom();
+    tg_geometry_init_line();
+    tg_geometry_init_ring();
+    tg_geometry_init_polygon();
+    tg_geometry_init_segment();
+    tg_geometry_init_nearest();
+    tg_geometry_init_rect();
+    tg_geometry_init_feature_source();
+    tg_geometry_init_index();
+    tg_geometry_init_debug();
 }
