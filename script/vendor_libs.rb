@@ -14,24 +14,24 @@ PINS = {
   tg: {
     repo: "https://github.com/tidwall/tg.git",
     ref: "main",
-    commit: "caf840504eaab4563280cf4ab16d618f69a23720",
-    sha256: "f8e0d904055c209b2a23a2200456f9374ab95cadb69e61b5721d7f8e2500e705",
+    commit: "532fc38e1a7bd440339cf83259a9d7983f04ad69",
+    sha256: "dbf9a49d5ff326974312e94fb39c5687260a2c2b27b10971b24635ed6f79184c",
     target: "tg",
     files: %w[tg.c tg.h LICENSE README.md]
   },
   rtree: {
     repo: "https://github.com/tidwall/rtree.c.git",
-    ref: "v0.5.3",
-    commit: "5717a8a1eb373428ebaae8c1c623f186ec46461f",
-    sha256: "4afc86cbd3abe03730206031a5aff5b8b29d37b055fc356052f6f06e1d1f9a61",
+    ref: "v0.6.1",
+    commit: "eebc774929f89fd5f4095f7c8835a87f2d2fb73f",
+    sha256: "6779f4b2c9df8f199907d26c3fba11bc07c6f923d80881577c19f50119e15177",
     target: "rtree",
     files: %w[rtree.c rtree.h LICENSE README.md]
   },
   json: {
     repo: "https://github.com/tidwall/json.c.git",
     ref: "main",
-    commit: "4aaf99b5c08e4e1364f97500fe5c5d5a2617b4a6",
-    sha256: "059393302de9325ab6ccf79c298234f2b688a59d138103305da317d2d0176fe2",
+    commit: "104d8cbf5d09ceba37d469574cbf5696349bcaf1",
+    sha256: "764155b839b910f45aaaf0d0881a47570d4ef0919465c5117c7658ab3dac0594",
     target: "json",
     files: %w[json.c json.h LICENSE]
   }
@@ -74,6 +74,10 @@ def normalize_tree!(directory)
     next if File.symlink?(path)
 
     if File.file?(path)
+      if %w[.c .h].include?(File.extname(path))
+        source = File.binread(path)
+        File.binwrite(path, source.gsub(/[ \t]+(?=\r?$)/, ""))
+      end
       File.chmod(0o644, path)
       File.utime(NORMALIZED_MTIME, NORMALIZED_MTIME, path)
     elsif File.directory?(path)

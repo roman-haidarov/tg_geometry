@@ -6092,8 +6092,6 @@ static char *fs_safe_tg_error_message(struct tg_geom *geom) {
     char *msg;
     int n;
 
-    if (!geom)
-        return fs_safe_strdup_cstr("TG geometry allocation failed");
     err = tg_geom_error(geom);
     if (!err)
         return NULL;
@@ -6112,12 +6110,13 @@ static bool fs_safe_validate_geometry(fs_safe_job_t *job, struct json geometry, 
     *skipped_out = false;
     struct tg_geom *geom = tg_parse_geojsonn_ix(json_raw(geometry), json_raw_length(geometry),
                                                 job->opts.geometry_index);
-    char *message = fs_safe_tg_error_message(geom);
+    char *message;
 
     if (!geom) {
         fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "TG geometry allocation failed");
         return false;
     }
+    message = fs_safe_tg_error_message(geom);
 
     if (message) {
         if (job->opts.on_invalid == FS_ON_INVALID_SKIP) {
@@ -6251,11 +6250,11 @@ static bool fs_safe_fill_build(fs_safe_job_t *job, struct json features) {
 
         geom = tg_parse_geojsonn_ix(json_raw(prepared.geometry), json_raw_length(prepared.geometry),
                                     job->opts.geometry_index);
-        message = fs_safe_tg_error_message(geom);
         if (!geom) {
             fs_safe_set_error(job, FS_SAFE_ERROR_NOMEM, "TG geometry allocation failed");
             return false;
         }
+        message = fs_safe_tg_error_message(geom);
         if (message) {
             fs_safe_set_feature_error(job, FS_SAFE_ERROR_PARSE, feature_index,
                                       fs_safe_json_offset(job, prepared.geometry), message);

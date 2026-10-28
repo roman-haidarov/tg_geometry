@@ -36,16 +36,16 @@ struct rtree *rtree_clone(struct rtree *tr);
 // The clone function should return true if the clone succeeded or false if the
 // system is out of memory.
 void rtree_set_item_callbacks(struct rtree *tr,
-    bool (*clone)(const void *item, void **into, void *udata), 
+    bool (*clone)(const void *item, void **into, void *udata),
     void (*free)(const void *item, void *udata));
 
-// rtree_set_udata sets the user-defined data. 
+// rtree_set_udata sets the user-defined data.
 //
-// This should be called once after rtree_new() and is only used for 
+// This should be called once after rtree_new() and is only used for
 // the item callbacks as defined in rtree_set_item_callbacks().
 void rtree_set_udata(struct rtree *tr, void *udata);
 
-// rtree_insert inserts an item into the rtree. 
+// rtree_insert inserts an item into the rtree.
 //
 // This operation performs a copy of the data that is pointed to in the second
 // and third arguments. The R-tree expects a rectangle, which is two arrays of
@@ -64,20 +64,20 @@ bool rtree_insert(struct rtree *tr, const double *min, const double *max, const 
 //
 // Returning false from the iter will stop the search.
 void rtree_search(const struct rtree *tr, const double *min, const double *max,
-    bool (*iter)(const double *min, const double *max, const void *data, void *udata), 
+    bool (*iter)(const double *min, const double *max, const void *data, void *udata),
     void *udata);
 
 // rtree_scan iterates over every item in the rtree.
 //
 // Returning false from the iter will stop the scan.
 void rtree_scan(const struct rtree *tr,
-    bool (*iter)(const double *min, const double *max, const void *data, void *udata), 
+    bool (*iter)(const double *min, const double *max, const void *data, void *udata),
     void *udata);
 
 // rtree_count returns the number of items in the rtree.
 size_t rtree_count(const struct rtree *tr);
 
-// rtree_delete deletes an item from the rtree. 
+// rtree_delete deletes an item from the rtree.
 //
 // This searches the tree for an item that is contained within the provided
 // rectangle, and perform a binary comparison of its data to the provided
@@ -92,14 +92,17 @@ bool rtree_delete(struct rtree *tr, const double *min, const double *max, const 
 // a compare function. The first item that is found is deleted.
 //
 // Returns false if the system is out of memory.
-bool rtree_delete_with_comparator(struct rtree *tr, const double *min, 
+bool rtree_delete_with_comparator(struct rtree *tr, const double *min,
     const double *max, const void *data,
     int (*compare)(const void *a, const void *b, void *udata),
     void *udata);
 
-// rtree_opt_relaxed_atomics activates memory_order_relaxed for all atomic
-// loads. This may increase performance for single-threaded programs.
-// Optionally, define RTREE_NOATOMICS to disbale all atomics.
+
+// rtree_rect returns the MBR.
+void rtree_rect(struct rtree *tr, double *min, double *max);
+
+
+// deprecated
 void rtree_opt_relaxed_atomics(struct rtree *tr);
 
 #endif // RTREE_H
